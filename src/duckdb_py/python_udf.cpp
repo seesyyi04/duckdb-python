@@ -19,6 +19,9 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb_python/python_conversion.hpp"
 
+#include "duckdb_python/python_udf_channel.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+
 namespace duckdb {
 
 static py::list ConvertToSingleBatch(vector<LogicalType> &types, vector<string> &names, DataChunk &input,
@@ -167,33 +170,28 @@ static void VerifyVectorizedNullHandling(Vector &result, idx_t count) {
 }
 
 static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExceptionHandling exception_handling,
-                                                  FunctionNullHandling null_handling) {
+                                                  FunctionNullHandling null_handling,
+												  shared_ptr<PythonUDFChannel> channel) {
 	// Through the capture of the lambda, we have access to the function pointer
 	// We just need to make sure that it doesn't get garbage collected
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void {
-		py::gil_scoped_acquire gil;
-
-		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
-
-		// owning references
-		py::object python_object;
-		// Convert the input datachunk to pyarrow
-		//		ClientProperties options;
-
-		//		if (state.HasContext()) {
 		auto &context = state.GetContext();
 		auto options = context.GetClientProperties();
-		//		}
-
+ 
+		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
+ 
+		// ---- NULL HANDLING (same as original) ----
 		auto result_validity = FlatVector::Validity(result);
 		SelectionVector selvec(input.size());
 		idx_t input_size = input.size();
+		idx_t count = input_size;
+ 
 		if (default_null_handling) {
 			vector<UnifiedVectorFormat> vec_data(input.ColumnCount());
 			for (idx_t i = 0; i < input.ColumnCount(); i++) {
 				input.data[i].ToUnifiedFormat(input.size(), vec_data[i]);
 			}
-
+ 
 			idx_t index = 0;
 			for (idx_t i = 0; i < input.size(); i++) {
 				bool any_null = false;
@@ -213,63 +211,177 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 			if (index != input.size()) {
 				input.Slice(selvec, index);
 			}
+			count = input.size();
 		}
+ 
+		// ---- CONVERT DataChunk TO Arrow C Data Interface ----
+		auto types = input.GetTypes();
+		vector<string> names;
+		names.reserve(types.size());
+		for (idx_t i = 0; i < types.size(); i++) {
+			names.push_back(StringUtil::Format("c%d", i));
+		}
+ 
+		ArrowSchema *schema = new ArrowSchema();
+		ArrowConverter::ToArrowSchema(schema, types, names, options);
+ 
+		ArrowAppender appender(types, STANDARD_VECTOR_SIZE, options,
+		                       ArrowTypeExtensionData::GetExtensionTypes(context, types));
+		appender.Append(input, 0, count, count);
+		auto array_result = appender.Finalize();
+ 
+		// Copy the ArrowArray to a heap-allocated struct that the channel owns.
+		ArrowArray *arr = new ArrowArray();
+		memcpy(arr, &array_result, sizeof(ArrowArray));
+		// Prevent the original from calling release — ownership transferred.
+		array_result.release = nullptr;
+ 
+		// ---- PUSH THROUGH CHANNEL ----
+		ArrowBatch batch{arr, schema};
+		auto task = make_shared_ptr<PythonUDFTask>(*channel, std::move(batch));
+ 
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		auto coroutine = task->ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
+		coroutine.set_scheduler(&scheduler);
+		coroutine.resume();
+ 
+		// Block until the coroutine completes.
+		// Yield the thread rather than spinning hot.
+		while (!coroutine.done()) {
+			TaskScheduler::YieldThread();
+		}
+ 
+		if (channel->HasError()) {
+			throw InvalidInputException("Python UDF error: %s", channel->GetError());
+		}
+ 
+		auto task_result = coroutine.result();
+		if (task_result == TaskExecutionResult::TASK_ERROR) {
+			throw InvalidInputException("Python UDF task failed");
+		}
+ 
+		// ---- CONVERT RESULT Arrow BACK TO Vector ----
+		auto &result_batch = task->GetResult();
 
-		auto pyarrow_table = ConvertDataChunkToPyArrowTable(input, options, state.GetContext());
-		py::tuple column_list = pyarrow_table.attr("columns");
+		// Build a one-shot ArrowArrayStream from the raw C Data Interface structs.
+		// This feeds into DuckDB's existing Arrow scan without touching Python.
+		struct SingleBatchStreamState {
+			ArrowArray *batch;
+			ArrowSchema *schema;
+			bool schema_consumed = false;
+			bool batch_consumed = false;
+		};
 
-		auto count = input.size();
+		auto stream_state = new SingleBatchStreamState{result_batch.array, result_batch.schema};
 
-		// Call the function
-		auto ret = PyObject_CallObject(function, column_list.ptr());
-		bool exception_occurred = false;
-		if (ret == nullptr && PyErr_Occurred()) {
-			exception_occurred = true;
-			if (exception_handling == PythonExceptionHandling::FORWARD_ERROR) {
-				auto exception = py::error_already_set();
-				throw InvalidInputException("Python exception occurred while executing the UDF: %s", exception.what());
-			} else if (exception_handling == PythonExceptionHandling::RETURN_NULL) {
-				PyErr_Clear();
-				python_object = py::module_::import("pyarrow").attr("nulls")(count);
-			} else {
-				throw NotImplementedException("Exception handling type not implemented");
+		ArrowArrayStream arrow_stream;
+		arrow_stream.private_data = stream_state;
+
+		arrow_stream.get_schema = [](ArrowArrayStream *stream, ArrowSchema *out) -> int {
+			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
+			if (!st->schema) return -1;
+			*out = *st->schema;
+			st->schema_consumed = true;
+			return 0;
+		};
+
+		arrow_stream.get_next = [](ArrowArrayStream *stream, ArrowArray *out) -> int {
+			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
+			if (st->batch_consumed || !st->batch) {
+				out->release = nullptr;
+				return 0;
 			}
-		} else {
-			python_object = py::reinterpret_steal<py::object>(ret);
-		}
-		if (!py::isinstance(python_object, py::module_::import("pyarrow").attr("lib").attr("Table"))) {
-			// Try to convert into a table
-			py::list single_array(1);
-			py::list single_name(1);
+			*out = *st->batch;
+			st->batch_consumed = true;
+			return 0;
+		};
 
-			single_array[0] = python_object;
-			single_name[0] = "c0";
-			try {
-				python_object = py::module_::import("pyarrow").attr("lib").attr("Table").attr("from_arrays")(
-				    single_array, py::arg("names") = single_name);
-			} catch (py::error_already_set &) {
-				throw InvalidInputException("Could not convert the result into an Arrow Table");
-			}
+		arrow_stream.get_last_error = [](ArrowArrayStream *stream) -> const char * {
+			return nullptr;
+		};
+
+		arrow_stream.release = [](ArrowArrayStream *stream) {
+			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
+			delete st;
+			stream->private_data = nullptr;
+			stream->release = nullptr;
+		};
+
+		// Use the existing Arrow scan bind/init/scan to convert to DataChunk.
+		auto stream_factory_produce = [](uintptr_t factory_ptr, ArrowStreamParameters &params) -> unique_ptr<ArrowArrayStreamWrapper> {
+			auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+			auto *stream_ptr = reinterpret_cast<ArrowArrayStream *>(factory_ptr);
+			wrapper->arrow_array_stream = *stream_ptr;
+			stream_ptr->release = nullptr;
+			return wrapper;
+		};
+
+		auto stream_factory_get_schema = [](uintptr_t factory_ptr, ArrowSchemaWrapper &schema) {
+			auto *stream_ptr = reinterpret_cast<ArrowArrayStream *>(factory_ptr);
+			stream_ptr->get_schema(stream_ptr, &schema.arrow_schema);
+		};
+
+		vector<Value> scan_children;
+		scan_children.push_back(Value::POINTER(CastPointerToValue(&arrow_stream)));
+		scan_children.push_back(Value::POINTER(CastPointerToValue(+stream_factory_produce)));
+		scan_children.push_back(Value::POINTER(CastPointerToValue(+stream_factory_get_schema)));
+
+		named_parameter_map_t scan_named_params;
+		vector<LogicalType> scan_input_types;
+		vector<string> scan_input_names;
+
+		TableFunctionRef scan_empty;
+		TableFunction scan_dummy;
+		scan_dummy.name = "ArrowResultScan";
+		TableFunctionBindInput scan_bind_input(scan_children, scan_named_params, scan_input_types,
+		                                       scan_input_names, nullptr, nullptr, scan_dummy, scan_empty);
+		vector<LogicalType> return_types;
+		vector<string> return_names;
+
+		auto scan_bind_data = ArrowTableFunction::ArrowScanBind(context, scan_bind_input, return_types, return_names);
+
+		if (return_types.size() != 1) {
+			arrow_stream.release(&arrow_stream);
+			throw InvalidInputException(
+			    "The returned table from a pyarrow scalar udf should only contain one column, found %d",
+			    return_types.size());
 		}
-		// Convert the pyarrow result back to a DuckDB datachunk
+
+		DataChunk result_chunk;
+		result_chunk.Initialize(context, return_types, STANDARD_VECTOR_SIZE);
+
+		vector<column_t> scan_column_ids = {0};
+		TableFunctionInitInput scan_init_input(scan_bind_data.get(), scan_column_ids, vector<idx_t>(), nullptr);
+		auto scan_global_state = ArrowTableFunction::ArrowScanInitGlobal(context, scan_init_input);
+		auto scan_local_state = ArrowTableFunction::ArrowScanInitLocalInternal(context, scan_init_input,
+		                                                                        scan_global_state.get());
+
+		TableFunctionInput scan_function_input(scan_bind_data.get(), scan_local_state.get(),
+		                                       scan_global_state.get());
+		ArrowTableFunction::ArrowScanFunction(context, scan_function_input, result_chunk);
+
+		if (result_chunk.size() != count) {
+			throw InvalidInputException("Returned pyarrow table should have %d tuples, found %d",
+			                            count, result_chunk.size());
+		}
+
+		// Arrow memory is owned by the stream and freed when the scan completes.
+		// The stream's release callback deletes the SingleBatchStreamState.
+		// We still need to free the outer structs we allocated.
+		delete result_batch.array;
+		delete result_batch.schema;
+		result_batch.array = nullptr;
+		result_batch.schema = nullptr;
+ 
+		// ---- REINSERT NULLS (same logic as original) ----
 		if (count != input_size) {
 			D_ASSERT(default_null_handling);
-			// We filtered out some NULLs, now we need to reconstruct the final result by adding the nulls back
 			Vector temp(result.GetType(), count);
-			// Convert the table into a temporary Vector
-			ConvertArrowTableToVector(python_object, temp, state.GetContext(), count);
-			if (!exception_occurred) {
-				VerifyVectorizedNullHandling(temp, count);
-			}
+			VectorOperations::Cast(context, result_chunk.data[0], temp, count);
 			if (count) {
 				SelectionVector inverted(input_size);
-				// Create a SelVec that inverts the filtering
-				// example: count: 6, null_indices: 1,3
-				// input selvec: [0, 2, 4, 5]
-				// inverted selvec: [0, 0, 1, 1, 2, 3]
 				idx_t src_index = 0;
 				for (idx_t i = 0; i < input_size; i++) {
-					// Fill the gaps with the previous index
 					inverted.set_index(i, src_index);
 					if (src_index + 1 < count && selvec.get_index(src_index) == i) {
 						src_index++;
@@ -282,12 +394,9 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 			}
 			result.Verify(input_size);
 		} else {
-			ConvertArrowTableToVector(python_object, result, state.GetContext(), count);
-			if (default_null_handling && !exception_occurred) {
-				VerifyVectorizedNullHandling(result, count);
-			}
+			VectorOperations::Cast(context, result_chunk.data[0], result, count);
 		}
-
+ 
 		if (input_size == 1) {
 			result.SetVectorType(VectorType::CONSTANT_VECTOR);
 		}
@@ -492,7 +601,7 @@ public:
 	}
 
 	ScalarFunction GetFunction(const py::function &udf, PythonExceptionHandling exception_handling, bool side_effects,
-	                           const ClientProperties &client_properties) {
+	                           const ClientProperties &client_properties, ClientContext &context) {
 
 		// Import this module, because importing this from a non-main thread causes a segfault
 
@@ -512,7 +621,10 @@ public:
 
 		scalar_function_t func;
 		if (vectorized) {
-			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling);
+			auto &scheduler = TaskScheduler::GetScheduler(context);
+			auto udf_channel = make_shared_ptr<PythonUDFChannel>(udf.ptr(), scheduler);
+			udf_channel->Start();
+			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, udf_channel);
 		} else {
 			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling);
 		}
@@ -538,7 +650,7 @@ ScalarFunction DuckDBPyConnection::CreateScalarUDF(const string &name, const py:
 	data.OverrideParameters(parameters);
 	data.OverrideReturnType(return_type);
 	data.Verify();
-	return data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties());
+	return data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties(), *connection.context);
 }
 
 } // namespace duckdb
