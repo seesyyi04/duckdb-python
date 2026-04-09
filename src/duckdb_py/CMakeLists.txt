@@ -28,6 +28,7 @@ add_library(
   python_dependency.cpp
   python_import_cache.cpp
   python_replacement_scan.cpp
-  python_udf.cpp)
+  python_udf.cpp
+  python_udf_channel.cpp)
 
 target_link_libraries(python_src PRIVATE _duckdb_dependencies)

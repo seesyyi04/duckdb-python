@@ -1,207 +1,213 @@
-#include "duckdb_python/python_udf_channel.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb_python/python_udf_channel.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb_python/python_conversion.hpp"
+
+#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/types/arrow_aux_data.hpp"
+#include "duckdb_python/arrow/arrow_export_utils.hpp"
+#include "duckdb_python/arrow/arrow_array_stream.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <Python.h>
-#include <stdexcept>
 #include <string>
-
-#ifndef ARROW_C_DATA_INTERFACE
-#define ARROW_C_DATA_INTERFACE
-
-struct ArrowSchema {
-	const char *format, *name, *metadata;
-	int64_t flags, n_children;
-	struct ArrowSchema **children, *dictionary;
-	void (*release)(struct ArrowSchema *);
-	void *private_data;
-};
-
-struct ArrowArray {
-	int64_t length, null_count, offset, n_buffers, n_children;
-	const void **buffers;
-	struct ArrowArray **children, *dictionary;
-	void (*release)(struct ArrowArray *);
-	void *private_data;
-};
-#endif
+#include <vector>
+#include <chrono>
 
 namespace duckdb {
-	PythonUDFChannel::PythonUDFChannel(PyObject *udf_func, TaskScheduler &scheduler, std::size_t buffer_capacity) 
-		: udf_func(udf_func), scheduler(scheduler) { Py_INCREF(udf_func); }
-	PythonUDFChannel::~PythonUDFChannel() {
-		Stop();
-		PyGILState_STATE gstate = PyGILState_Ensure();
-		Py_DECREF(udf_func);
+PythonUDFChannel::PythonUDFChannel(TaskScheduler &scheduler, std::size_t buffer_capacity) 
+	: scheduler(scheduler) { }
+PythonUDFChannel::~PythonUDFChannel() {
+	Stop();
+	PyGILState_STATE gstate = PyGILState_Ensure();
+	PyGILState_Release(gstate);
+}
+
+void PythonUDFChannel::Start() {
+	if (running.load()) { return; }
+	running.store(true);
+	python_thread = std::make_unique<std::thread>([this]() {
+		PythonThreadLoop();
+	});
+}
+
+void PythonUDFChannel::Stop() {
+	if (!running.load()) { return; }
+	running.store(false);
+
+	UDFBatch *poison_batch = MakePoison();
+	while (!input_buffer.try_push_sync(poison_batch)) {}
+
+	if (python_thread && python_thread->joinable()) python_thread->join();
+	python_thread.reset();
+}
+
+bool PythonUDFChannel::HasError() const { return has_error.load(std::memory_order_acquire); }
+
+std::string PythonUDFChannel::GetError() const {
+	if (has_error.load(std::memory_order_acquire)) { return error_message; }
+	return {};
+}
+
+static void SignalBatchDone(UDFBatch *batch) {
+	batch->done.store(true, std::memory_order_release);
+	auto *waiter = batch->completion_waiters.try_pop();
+	if (waiter) {
+		waiter->self_handle.resume();
+	}
+}
+ 
+void PythonUDFChannel::PythonThreadLoop() {
+	static constexpr int MAX_BATCH_PER_GIL = 4;
+	PyGILState_STATE gstate = PyGILState_Ensure(); 
+
+	PyObject *pa_module = PyImport_ImportModule("pyarrow");
+	if (!pa_module) {
+		has_error.store(true, std::memory_order_release);
+		error_message = "Failed to import pyarrow";
+		PyErr_Clear();
 		PyGILState_Release(gstate);
+		return;
 	}
 
-	void PythonUDFChannel::Start() {
-		if (running.load()) { return; }
-		running.store(true);
-		python_thread = std::make_unique<std::thread>([this]() {
-			PythonThreadLoop();
-		});
-	}
+	while (running.load(std::memory_order_relaxed)) {
+		PyThreadState *tstate = PyEval_SaveThread();
+		auto first = input_buffer.blocking_pop();
+		PyEval_RestoreThread(tstate);
 
-	void PythonUDFChannel::Stop() {
-		if (!running.load()) { return; }
-		running.store(false);
+        if (!first.has_value()) continue;
+        if (IsPoison(*first.value())) break;
 
-		ArrowBatch poison = MakePoison();
-		while (!input_buffer.try_push_sync(poison)) {
-			// spin
+		// ---- COLLECT BATCHES ----
+		vector<UDFBatch *> batch_group;
+		batch_group.reserve(MAX_BATCH_PER_GIL);
+		batch_group.push_back(first.value());
+		for (int i = 1; i < MAX_BATCH_PER_GIL; i++) {
+			auto extra = input_buffer.try_pop();
+			if (!extra.has_value()) break;
+			if (IsPoison(*extra.value())) break;
+			batch_group.push_back(extra.value());
 		}
-		if (python_thread && python_thread->joinable()) { python_thread->join(); }
-		python_thread.reset();
-	}
-
-	bool PythonUDFChannel::HasError() const { return has_error.load(std::memory_order_acquire); }
-
-	std::string PythonUDFChannel::GetError() const {
-		if (has_error.load(std::memory_order_acquire)) { return error_message; }
-		return {};
-	}
-
-	void PythonUDFChannel::PythonThreadLoop() {
-		// acquire GIL for this thread
-		PyGILState_STATE gstate = PyGILState_Ensure();
-		// import pyarrow
-		PyObject *pa_module = PyImport_ImportModule("pyarrow");
-		if (!pa_module) {
-			has_error.store(true, std::memory_order_release);
-			error_message = "Failed to import pyarrow";
-			PyErr_Clear();
-			PyGILState_Release(gstate);
-			return;
-		}
-
-		while (true) {
-			// release GIL while waiting for C++ input
-			Py_BEGIN_ALLOW_THREADS
-
-			// busy-poll the MPSC buffer; single consumer path, no contention
-			std::optional<ArrowBatch> maybe_batch;
-			while (running.load(std::memory_order_relaxed)) {
-				maybe_batch = input_buffer.try_pop();
-				if (maybe_batch.has_value()) break;
-				// yield to avoid burning CPU while waiting
-				std::this_thread::yield();
-			}
-
-			Py_END_ALLOW_THREADS
-
-			if (!maybe_batch.has_value()) break; 
-			ArrowBatch batch = std::move(maybe_batch.value());
-
-			if (IsPoison(batch)) break;
-
-			PyObject *pa_record_batch_type = PyObject_GetAttrString(pa_module, "RecordBatch");
-			if (!pa_record_batch_type) {
-				has_error.store(true, std::memory_order_release);
-				error_message = "Failed to get pyarrow.RecordBatch";
-				PyErr_Clear();
-				break;
-			}
-
-			PyObject *import_func = PyObject_GetAttrString(pa_record_batch_type, "_import_from_c");
-			Py_DECREF(pa_record_batch_type);
-			if (!import_func) {
-				has_error.store(true, std::memory_order_release);
-				error_message = "Failed to get RecordBatch._import_from_c";
-				PyErr_Clear();
-				break;
-			}
-
-			PyObject *args = Py_BuildValue("(nn)",
-										  reinterpret_cast<Py_ssize_t>(batch.array),
-										  reinterpret_cast<Py_ssize_t>(batch.schema));
-			PyObject *py_batch = PyObject_CallObject(import_func, args);
-			Py_DECREF(import_func);
-			Py_DECREF(args);
-
-			if (!py_batch) {
-				has_error.store(true, std::memory_order_release);
-				error_message = "Failed to import Arrow batch into PyArrow";
-				PyErr_Clear();
-				break;
-			}
-
-			// call the UDF
-			PyObject *call_args = PyTuple_Pack(1, py_batch);
-			PyObject *py_result = PyObject_CallObject(udf_func, call_args);
-			Py_DECREF(call_args);
-			Py_DECREF(py_batch);
-
-			if (!py_result) {
-				has_error.store(true, std::memory_order_release);
-				// extract python exception message
-				PyObject *ptype, *pvalue, *ptraceback;
-				PyErr_Fetch(&ptype, &pvalue, &ptraceback);
-				if (pvalue) {
-					PyObject *str_obj = PyObject_Str(pvalue);
-					if (str_obj) {
-						const char *err_str = PyUnicode_AsUTF8(str_obj);
-						if (err_str) {
-							error_message = std::string("Python UDF error: ") + err_str;
+ 
+		// ---- PROCESS ALL BATCHES WITH GIL HELD ----
+		bool should_exit = false;
+ 
+		for (auto *batch : batch_group) {
+			try {
+				DataChunk *input_chunk = batch->input;
+				DataChunk *result_chunk = batch->result;
+			
+				// ---- CONVERT DataChunk → PyArrow Table ----	
+				auto types = input_chunk->GetTypes();
+				vector<string> names;
+				names.reserve(types.size());
+				for (idx_t i = 0; i < types.size(); i++) {
+					names.push_back(StringUtil::Format("c%d", i));
+				}
+	 
+				py::list single_batch_list;
+				TransformDuckToArrowChunk(batch->arrow_schema, batch->arrow_array, single_batch_list);
+	 
+				py::object pyarrow_table = pyarrow::ToArrowTable(types, names, single_batch_list, batch->client_props);
+				py::tuple column_list = pyarrow_table.attr("columns");
+				idx_t row_count = input_chunk->size();
+				auto t1 = std::chrono::high_resolution_clock::now();
+	 
+				// ---- CALL UDF ----
+				auto ret = PyObject_CallObject(batch->udf_func, column_list.ptr());
+	
+				if (ret == nullptr && PyErr_Occurred()) {
+					has_error.store(true, std::memory_order_release);
+					PyObject *ptype, *pvalue, *ptraceback;
+					PyErr_Fetch(&ptype, &pvalue, &ptraceback);
+					if (pvalue) {
+						PyObject *str_obj = PyObject_Str(pvalue);
+						if (str_obj) {
+							const char *err_str = PyUnicode_AsUTF8(str_obj);
+							if (err_str) error_message = std::string("Python UDF error: ") + err_str;
+							Py_DECREF(str_obj);
 						}
-						Py_DECREF(str_obj);
+					}
+					Py_XDECREF(ptype);
+					Py_XDECREF(pvalue);
+					Py_XDECREF(ptraceback);
+					SignalBatchDone(batch);
+					should_exit = true;
+					break;
+				}
+				py::object python_result = py::reinterpret_steal<py::object>(ret);
+				
+				// Convert result to Python list
+				py::list result_list;
+				try {
+					if (py::isinstance<py::list>(python_result)) {
+						result_list = python_result;
+					} else {
+						result_list = python_result.attr("to_pylist")();
+					}
+				} catch (...) {
+					has_error.store(true, std::memory_order_release);
+					error_message = "Could not convert UDF result to list";
+					SignalBatchDone(batch);
+					should_exit = true;
+					break;
+				}
+	
+				if ((idx_t)py::len(result_list) != row_count) {
+					has_error.store(true, std::memory_order_release);
+					error_message = StringUtil::Format("UDF returned %d rows, expected %d",
+													   (int)py::len(result_list), row_count);
+					SignalBatchDone(batch);
+					should_exit = true;
+					break;
+				}
+
+				result_chunk->SetCardinality(row_count);
+				
+				auto &out_vec = result_chunk->data[0];
+				for (idx_t i = 0; i < row_count; i++) {
+					py::handle val = result_list[i];
+					if (val.is_none()) {
+						FlatVector::SetNull(out_vec, i, true);
+					} else {
+						TransformPythonObject(py::reinterpret_borrow<py::object>(val), out_vec, i);
 					}
 				}
-				Py_XDECREF(ptype);
-				Py_XDECREF(pvalue);
-				Py_XDECREF(ptraceback);
-				break;
-			}
-			// export result back to Arrow C data interface
-			ArrowArray *result_array = new ArrowArray();
-			ArrowSchema *result_schema = new ArrowSchema();
-			memset(result_array, 0, sizeof(ArrowArray));
-			memset(result_schema, 0, sizeof(ArrowSchema));
-	
-			PyObject *export_func = PyObject_GetAttrString(py_result, "_export_to_c");
-			if (!export_func) {
-				has_error.store(true, std::memory_order_release);
-				error_message = "Result does not support _export_to_c";
-				PyErr_Clear();
-				Py_DECREF(py_result);
-				delete result_array;
-				delete result_schema;
-				break;
-			}
-	
-			PyObject *export_args = Py_BuildValue("(nn)",
-												  reinterpret_cast<Py_ssize_t>(result_array),
-												  reinterpret_cast<Py_ssize_t>(result_schema));
-			PyObject *export_ret = PyObject_CallObject(export_func, export_args);
-			Py_DECREF(export_func);
-			Py_DECREF(export_args);
-			Py_DECREF(py_result);
-	
-			if (!export_ret) {
-				has_error.store(true, std::memory_order_release);
-				error_message = "Failed to export result to Arrow C Data Interface";
-				PyErr_Clear();
-				delete result_array;
-				delete result_schema;
-				break;
-			}
-			Py_DECREF(export_ret);
-	
-			// push result to SPMC buffer for C++ consumers
-			ArrowBatch result_batch{result_array, result_schema};
-	
-			// release GIL while pushing so C++ coroutines can resume
-			Py_BEGIN_ALLOW_THREADS
-			while (!output_buffer.try_push(result_batch)) std::this_thread::yield();
-			Py_END_ALLOW_THREADS
+				out_vec.Flatten(row_count);
+				result_list = py::list();   // release list
+				python_result = py::none(); // release UDF return value
+				column_list = py::tuple();  // release input columns
+				pyarrow_table = py::none(); // release arrow table
+	 
+				// ---- SIGNAL THIS BATCH DONE ----
+				SignalBatchDone(batch);
+
+			} catch (const std::exception& e) {
+                // Catches DuckDB InternalExceptions or pybind11 errors cleanly
+                has_error.store(true, std::memory_order_release);
+                error_message = std::string("C++ Exception in Python thread: ") + e.what();
+                SignalBatchDone(batch);
+                should_exit = true;
+                break;
+            } catch (...) {
+                has_error.store(true, std::memory_order_release);
+                error_message = "Unknown C++ Exception in Python thread";
+                SignalBatchDone(batch);
+                should_exit = true;
+                break;
+            }
 		}
-		Py_DECREF(pa_module);
-		PyGILState_Release(gstate);
+		if (should_exit) break;
 	}
+	Py_DECREF(pa_module);
+	PyGILState_Release(gstate);
+}
 
-
-PythonUDFTask::PythonUDFTask(PythonUDFChannel &channel, ArrowBatch input)
-	: channel(channel), input(std::move(input)) {}
+PythonUDFTask::PythonUDFTask(PythonUDFChannel &channel, UDFBatch &batch)
+	: channel(channel), batch(batch) {}
 
 TaskExecutionResult PythonUDFTask::Execute(TaskExecutionMode mode) {
 	return TaskExecutionResult::TASK_ERROR;
@@ -212,10 +218,9 @@ TaskCoroutine PythonUDFTask::ExecuteAsync(TaskExecutionMode mode) {
 		co_return TaskExecutionResult::TASK_ERROR;
 	}
 	// push input batch into the channel for the Python thread
-	co_await channel.GetInputBuffer().push(input);
+	co_await channel.GetInputBuffer().push(&batch);
 	
-	// wait for a result to come back from the python thread
-	co_await channel.GetOutputBuffer().pop(result);
+	co_await DoneAwaitable{batch.done, batch.completion_waiters};
 
 	if (channel.HasError()) {
 		co_return TaskExecutionResult::TASK_ERROR;

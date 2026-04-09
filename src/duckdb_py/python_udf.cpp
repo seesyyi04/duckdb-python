@@ -19,8 +19,8 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb_python/python_conversion.hpp"
 
-#include "duckdb_python/python_udf_channel.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb_python/python_udf_channel.hpp"
 
 namespace duckdb {
 
@@ -169,29 +169,53 @@ static void VerifyVectorizedNullHandling(Vector &result, idx_t count) {
 	throw InvalidInputException(NullHandlingError());
 }
 
+static void WaitForCoroutineWithWorkStealing(UDFBatch &batch, TaskScheduler &scheduler) {
+	while (!batch.done.load(std::memory_order_acquire)) {
+		shared_ptr<Task> other_task;
+		if (scheduler.GetAnyTask(other_task)) {
+			auto r = other_task->Execute(TaskExecutionMode::PROCESS_ALL);
+			switch (r) {
+			case TaskExecutionResult::TASK_FINISHED:
+			case TaskExecutionResult::TASK_ERROR:
+				other_task.reset();
+				break;
+			case TaskExecutionResult::TASK_NOT_FINISHED: {
+				auto &t = *other_task->token;
+				scheduler.ScheduleTask(t, std::move(other_task));
+				break;
+			}
+			case TaskExecutionResult::TASK_BLOCKED:
+				other_task->Deschedule();
+				other_task.reset();
+				break;
+			}
+			continue;
+		}
+		TaskScheduler::YieldThread();
+	}
+}
+
 static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExceptionHandling exception_handling,
                                                   FunctionNullHandling null_handling,
-												  shared_ptr<PythonUDFChannel> channel) {
-	// Through the capture of the lambda, we have access to the function pointer
-	// We just need to make sure that it doesn't get garbage collected
+                                                  shared_ptr<PythonUDFChannel> channel) {
+ 
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void {
 		auto &context = state.GetContext();
-		auto options = context.GetClientProperties();
- 
 		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
+		auto &scheduler = TaskScheduler::GetScheduler(context);
  
-		// ---- NULL HANDLING (same as original) ----
+		// ---- NULL HANDLING ----
 		auto result_validity = FlatVector::Validity(result);
 		SelectionVector selvec(input.size());
 		idx_t input_size = input.size();
 		idx_t count = input_size;
+		bool has_nulls = false;
  
 		if (default_null_handling) {
 			vector<UnifiedVectorFormat> vec_data(input.ColumnCount());
 			for (idx_t i = 0; i < input.ColumnCount(); i++) {
 				input.data[i].ToUnifiedFormat(input.size(), vec_data[i]);
 			}
- 
 			idx_t index = 0;
 			for (idx_t i = 0; i < input.size(); i++) {
 				bool any_null = false;
@@ -210,196 +234,82 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 			}
 			if (index != input.size()) {
 				input.Slice(selvec, index);
+				has_nulls = true;
 			}
 			count = input.size();
 		}
  
-		// ---- CONVERT DataChunk TO Arrow C Data Interface ----
-		auto types = input.GetTypes();
-		vector<string> names;
-		names.reserve(types.size());
-		for (idx_t i = 0; i < types.size(); i++) {
-			names.push_back(StringUtil::Format("c%d", i));
-		}
+		// ---- BUILD UDFBatch ON STACK ----
+		auto result_chunk = make_uniq<DataChunk>();
+		vector<LogicalType> result_types = {result.GetType()};
+		result_chunk->Initialize(Allocator::Get(context), result_types, STANDARD_VECTOR_SIZE);
+		
+		UDFBatch batch;
+		batch.input = &input;
+		batch.context = &context;
+		batch.result = result_chunk.get();
+		batch.udf_func = function;
+		batch.return_type = result.GetType();
+		batch.done.store(false, std::memory_order_relaxed);
+		batch.poison = false;
+		batch.client_props = context.GetClientProperties();
+
+		// 1. ---- PREPARE ARROW (Before dispatch!) ----
+        auto types = input.GetTypes();
+        vector<string> names;
+        for (idx_t i = 0; i < types.size(); i++) {
+            names.push_back(StringUtil::Format("c%d", i));
+        }
+        batch.client_props = context.GetClientProperties();
+        
+        ArrowConverter::ToArrowSchema(&batch.arrow_schema, types, names, batch.client_props);
+        ArrowAppender appender(types, STANDARD_VECTOR_SIZE, batch.client_props,
+                               ArrowTypeExtensionData::GetExtensionTypes(context, types));
+        appender.Append(input, 0, input.size(), input.size());
+        batch.arrow_array = appender.Finalize();
+
+        // 2. ---- DISPATCH TASK ----
+        PythonUDFTask task(*channel, batch);
+        auto coroutine = task.ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
+        coroutine.set_scheduler(&scheduler);
+        coroutine.resume();
  
-		ArrowSchema *schema = new ArrowSchema();
-		ArrowConverter::ToArrowSchema(schema, types, names, options);
- 
-		ArrowAppender appender(types, STANDARD_VECTOR_SIZE, options,
-		                       ArrowTypeExtensionData::GetExtensionTypes(context, types));
-		appender.Append(input, 0, count, count);
-		auto array_result = appender.Finalize();
- 
-		// Copy the ArrowArray to a heap-allocated struct that the channel owns.
-		ArrowArray *arr = new ArrowArray();
-		memcpy(arr, &array_result, sizeof(ArrowArray));
-		// Prevent the original from calling release — ownership transferred.
-		array_result.release = nullptr;
- 
-		// ---- PUSH THROUGH CHANNEL ----
-		ArrowBatch batch{arr, schema};
-		auto task = make_shared_ptr<PythonUDFTask>(*channel, std::move(batch));
- 
-		auto &scheduler = TaskScheduler::GetScheduler(context);
-		auto coroutine = task->ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
-		coroutine.set_scheduler(&scheduler);
-		coroutine.resume();
- 
-		// Block until the coroutine completes.
-		// Yield the thread rather than spinning hot.
-		while (!coroutine.done()) {
-			TaskScheduler::YieldThread();
-		}
- 
-		if (channel->HasError()) {
-			throw InvalidInputException("Python UDF error: %s", channel->GetError());
-		}
- 
-		auto task_result = coroutine.result();
-		if (task_result == TaskExecutionResult::TASK_ERROR) {
-			throw InvalidInputException("Python UDF task failed");
-		}
- 
-		// ---- CONVERT RESULT Arrow BACK TO Vector ----
-		auto &result_batch = task->GetResult();
+        // 3. ---- WAIT FOR COMPLETION ----
+        WaitForCoroutineWithWorkStealing(batch, scheduler);
+		D_ASSERT(result_chunk->size() == count);
 
-		// Build a one-shot ArrowArrayStream from the raw C Data Interface structs.
-		// This feeds into DuckDB's existing Arrow scan without touching Python.
-		struct SingleBatchStreamState {
-			ArrowArray *batch;
-			ArrowSchema *schema;
-			bool schema_consumed = false;
-			bool batch_consumed = false;
-		};
+        if (channel->HasError()) {
+            throw InvalidInputException("Python UDF error: %s", channel->GetError());
+        }
 
-		auto stream_state = new SingleBatchStreamState{result_batch.array, result_batch.schema};
+        if (has_nulls) {
+            // Map the sliced/compacted results back to their original row positions
+            SelectionVector inverted(input_size);
+            idx_t src_idx = 0;
+            for (idx_t i = 0; i < input_size; i++) {
+                inverted.set_index(i, src_idx);
+                if (src_idx < count && selvec.get_index(src_idx) == i) {
+                    src_idx++;
+                }
+            }
 
-		ArrowArrayStream arrow_stream;
-		arrow_stream.private_data = stream_state;
+            // Perform a Deep Copy from the temp chunk directly into the output vector.
+            // This ensures strings are stored in 'result's heap, not the stack-local chunk's heap.
+            VectorOperations::Copy(result_chunk->data[0], result, inverted, count, 0, 0);
 
-		arrow_stream.get_schema = [](ArrowArrayStream *stream, ArrowSchema *out) -> int {
-			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
-			if (!st->schema) return -1;
-			*out = *st->schema;
-			st->schema_consumed = true;
-			return 0;
-		};
+            // Restore the NULL markers for rows that were filtered out during null handling
+            for (idx_t i = 0; i < input_size; i++) {
+                if (!result_validity.RowIsValid(i)) {
+                    FlatVector::SetNull(result, i, true);
+                }
+            }
+        } else {
+            VectorOperations::Copy(result_chunk->data[0], result, count, 0, 0);
+        }
 
-		arrow_stream.get_next = [](ArrowArrayStream *stream, ArrowArray *out) -> int {
-			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
-			if (st->batch_consumed || !st->batch) {
-				out->release = nullptr;
-				return 0;
-			}
-			*out = *st->batch;
-			st->batch_consumed = true;
-			return 0;
-		};
-
-		arrow_stream.get_last_error = [](ArrowArrayStream *stream) -> const char * {
-			return nullptr;
-		};
-
-		arrow_stream.release = [](ArrowArrayStream *stream) {
-			auto *st = static_cast<SingleBatchStreamState *>(stream->private_data);
-			delete st;
-			stream->private_data = nullptr;
-			stream->release = nullptr;
-		};
-
-		// Use the existing Arrow scan bind/init/scan to convert to DataChunk.
-		auto stream_factory_produce = [](uintptr_t factory_ptr, ArrowStreamParameters &params) -> unique_ptr<ArrowArrayStreamWrapper> {
-			auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
-			auto *stream_ptr = reinterpret_cast<ArrowArrayStream *>(factory_ptr);
-			wrapper->arrow_array_stream = *stream_ptr;
-			stream_ptr->release = nullptr;
-			return wrapper;
-		};
-
-		auto stream_factory_get_schema = [](uintptr_t factory_ptr, ArrowSchemaWrapper &schema) {
-			auto *stream_ptr = reinterpret_cast<ArrowArrayStream *>(factory_ptr);
-			stream_ptr->get_schema(stream_ptr, &schema.arrow_schema);
-		};
-
-		vector<Value> scan_children;
-		scan_children.push_back(Value::POINTER(CastPointerToValue(&arrow_stream)));
-		scan_children.push_back(Value::POINTER(CastPointerToValue(+stream_factory_produce)));
-		scan_children.push_back(Value::POINTER(CastPointerToValue(+stream_factory_get_schema)));
-
-		named_parameter_map_t scan_named_params;
-		vector<LogicalType> scan_input_types;
-		vector<string> scan_input_names;
-
-		TableFunctionRef scan_empty;
-		TableFunction scan_dummy;
-		scan_dummy.name = "ArrowResultScan";
-		TableFunctionBindInput scan_bind_input(scan_children, scan_named_params, scan_input_types,
-		                                       scan_input_names, nullptr, nullptr, scan_dummy, scan_empty);
-		vector<LogicalType> return_types;
-		vector<string> return_names;
-
-		auto scan_bind_data = ArrowTableFunction::ArrowScanBind(context, scan_bind_input, return_types, return_names);
-
-		if (return_types.size() != 1) {
-			arrow_stream.release(&arrow_stream);
-			throw InvalidInputException(
-			    "The returned table from a pyarrow scalar udf should only contain one column, found %d",
-			    return_types.size());
-		}
-
-		DataChunk result_chunk;
-		result_chunk.Initialize(context, return_types, STANDARD_VECTOR_SIZE);
-
-		vector<column_t> scan_column_ids = {0};
-		TableFunctionInitInput scan_init_input(scan_bind_data.get(), scan_column_ids, vector<idx_t>(), nullptr);
-		auto scan_global_state = ArrowTableFunction::ArrowScanInitGlobal(context, scan_init_input);
-		auto scan_local_state = ArrowTableFunction::ArrowScanInitLocalInternal(context, scan_init_input,
-		                                                                        scan_global_state.get());
-
-		TableFunctionInput scan_function_input(scan_bind_data.get(), scan_local_state.get(),
-		                                       scan_global_state.get());
-		ArrowTableFunction::ArrowScanFunction(context, scan_function_input, result_chunk);
-
-		if (result_chunk.size() != count) {
-			throw InvalidInputException("Returned pyarrow table should have %d tuples, found %d",
-			                            count, result_chunk.size());
-		}
-
-		// Arrow memory is owned by the stream and freed when the scan completes.
-		// The stream's release callback deletes the SingleBatchStreamState.
-		// We still need to free the outer structs we allocated.
-		delete result_batch.array;
-		delete result_batch.schema;
-		result_batch.array = nullptr;
-		result_batch.schema = nullptr;
- 
-		// ---- REINSERT NULLS (same logic as original) ----
-		if (count != input_size) {
-			D_ASSERT(default_null_handling);
-			Vector temp(result.GetType(), count);
-			VectorOperations::Cast(context, result_chunk.data[0], temp, count);
-			if (count) {
-				SelectionVector inverted(input_size);
-				idx_t src_index = 0;
-				for (idx_t i = 0; i < input_size; i++) {
-					inverted.set_index(i, src_index);
-					if (src_index + 1 < count && selvec.get_index(src_index) == i) {
-						src_index++;
-					}
-				}
-				VectorOperations::Copy(temp, result, inverted, count, 0, 0, input_size);
-			}
-			for (idx_t i = 0; i < input_size; i++) {
-				FlatVector::SetNull(result, i, !result_validity.RowIsValid(i));
-			}
-			result.Verify(input_size);
-		} else {
-			VectorOperations::Cast(context, result_chunk.data[0], result, count);
-		}
- 
-		if (input_size == 1) {
-			result.SetVectorType(VectorType::CONSTANT_VECTOR);
-		}
+        // 6. ---- CLEANUP ARROW ----
+        if (batch.arrow_schema.release) batch.arrow_schema.release(&batch.arrow_schema);
+        if (batch.arrow_array.release) batch.arrow_array.release(&batch.arrow_array);
 	};
 	return func;
 }
@@ -502,23 +412,17 @@ static bool NumpyDeprecatesAccessToCore(const py::tuple &numpy_version) {
 }
 
 struct PythonUDFData {
-public:
-	PythonUDFData(const string &name, bool vectorized, FunctionNullHandling null_handling)
-	    : name(name), null_handling(null_handling), vectorized(vectorized) {
-		return_type = LogicalType::INVALID;
-		param_count = DConstants::INVALID_INDEX;
-	}
-
-public:
 	string name;
 	vector<LogicalType> parameters;
-	LogicalType return_type;
+	LogicalType return_type = LogicalType::INVALID;
 	LogicalType varargs = LogicalTypeId::INVALID;
 	FunctionNullHandling null_handling;
-	idx_t param_count;
+	idx_t param_count = DConstants::INVALID_INDEX;
 	bool vectorized;
 
-public:
+	PythonUDFData(const string &name, bool vectorized, FunctionNullHandling null_handling)
+	    : name(name), null_handling(null_handling), vectorized(vectorized) {}
+
 	void Verify() {
 		if (return_type == LogicalType::INVALID) {
 			throw InvalidInputException("Could not infer the return type, please set it explicitly");
@@ -622,9 +526,17 @@ public:
 		scalar_function_t func;
 		if (vectorized) {
 			auto &scheduler = TaskScheduler::GetScheduler(context);
-			auto udf_channel = make_shared_ptr<PythonUDFChannel>(udf.ptr(), scheduler);
-			udf_channel->Start();
-			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, udf_channel);
+			// auto udf_channel = make_shared_ptr<PythonUDFChannel>(udf.ptr(), scheduler);
+			// udf_channel->Start();
+			// static shared_ptr<PythonUDFChannel> shared_channel;
+			// static std::once_flag channel_init;
+			// std::call_once(channel_init, [&]() {
+			// 	shared_channel = make_shared_ptr<PythonUDFChannel>(scheduler);
+			// 	shared_channel->Start();
+			// });
+			auto shared_channel = make_shared_ptr<PythonUDFChannel>(scheduler);
+			shared_channel->Start();
+			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, shared_channel);
 		} else {
 			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling);
 		}
