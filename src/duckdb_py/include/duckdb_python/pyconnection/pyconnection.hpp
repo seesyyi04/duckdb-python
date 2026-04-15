@@ -27,6 +27,9 @@
 #include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
+
+class PythonUDFChannel;
+
 struct BoundParameterData;
 
 enum class PythonEnvironmentType { NORMAL, INTERACTIVE, JUPYTER };
@@ -231,6 +234,8 @@ public:
 	                  FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING,
 	                  PythonExceptionHandling exception_handling = PythonExceptionHandling::FORWARD_ERROR,
 	                  bool side_effects = false);
+
+	shared_ptr<PythonUDFChannel> udf_channel;
 
 	shared_ptr<DuckDBPyConnection> UnregisterUDF(const string &name);
 

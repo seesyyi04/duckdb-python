@@ -60,6 +60,7 @@
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/parser/statement/load_statement.hpp"
 #include "duckdb_python/expression/pyexpression.hpp"
+#include "duckdb_python/python_udf_channel.hpp"
 
 #include <random>
 
@@ -79,6 +80,9 @@ DuckDBPyConnection::~DuckDBPyConnection() {
 		// Release any structures that do not need to hold the GIL here
 		con.SetDatabase(nullptr);
 		con.SetConnection(nullptr);
+		if (udf_channel) {
+			udf_channel->Stop();
+		}
 	} catch (...) { // NOLINT
 	}
 }
@@ -461,6 +465,15 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
 		                              "functions with the same name is not supported yet, please remove it first",
 		                              name);
 	}
+
+	if (type == PythonUDFType::ARROW && !udf_channel) {
+		D_ASSERT(py::gil_check());
+		udf_channel = make_shared_ptr<PythonUDFChannel>(
+			TaskScheduler::GetScheduler(context)
+		);
+		udf_channel->Start();
+	}
+
 	auto scalar_function = CreateScalarUDF(name, udf, parameters_p, return_type_p, type == PythonUDFType::ARROW,
 	                                       null_handling, exception_handling, side_effects);
 	CreateScalarFunctionInfo info(scalar_function);
@@ -1893,6 +1906,12 @@ int DuckDBPyConnection::GetRowcount() {
 void DuckDBPyConnection::Close() {
 	con.SetResult(nullptr);
 	D_ASSERT(py::gil_check());
+
+	if (udf_channel) {
+		udf_channel->Stop();
+		udf_channel.reset();
+	}
+
 	py::gil_scoped_release release;
 	con.SetConnection(nullptr);
 	con.SetDatabase(nullptr);

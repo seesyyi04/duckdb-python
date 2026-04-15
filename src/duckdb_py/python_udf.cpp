@@ -283,7 +283,6 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
         }
 
         if (has_nulls) {
-            // Map the sliced/compacted results back to their original row positions
             SelectionVector inverted(input_size);
             idx_t src_idx = 0;
             for (idx_t i = 0; i < input_size; i++) {
@@ -292,12 +291,8 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
                     src_idx++;
                 }
             }
-
-            // Perform a Deep Copy from the temp chunk directly into the output vector.
-            // This ensures strings are stored in 'result's heap, not the stack-local chunk's heap.
             VectorOperations::Copy(result_chunk->data[0], result, inverted, count, 0, 0);
 
-            // Restore the NULL markers for rows that were filtered out during null handling
             for (idx_t i = 0; i < input_size; i++) {
                 if (!result_validity.RowIsValid(i)) {
                     FlatVector::SetNull(result, i, true);
@@ -505,7 +500,7 @@ struct PythonUDFData {
 	}
 
 	ScalarFunction GetFunction(const py::function &udf, PythonExceptionHandling exception_handling, bool side_effects,
-	                           const ClientProperties &client_properties, ClientContext &context) {
+	                           const ClientProperties &client_properties, ClientContext &context, shared_ptr<PythonUDFChannel> channel) {
 
 		// Import this module, because importing this from a non-main thread causes a segfault
 
@@ -525,18 +520,7 @@ struct PythonUDFData {
 
 		scalar_function_t func;
 		if (vectorized) {
-			auto &scheduler = TaskScheduler::GetScheduler(context);
-			// auto udf_channel = make_shared_ptr<PythonUDFChannel>(udf.ptr(), scheduler);
-			// udf_channel->Start();
-			// static shared_ptr<PythonUDFChannel> shared_channel;
-			// static std::once_flag channel_init;
-			// std::call_once(channel_init, [&]() {
-			// 	shared_channel = make_shared_ptr<PythonUDFChannel>(scheduler);
-			// 	shared_channel->Start();
-			// });
-			auto shared_channel = make_shared_ptr<PythonUDFChannel>(scheduler);
-			shared_channel->Start();
-			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, shared_channel);
+			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, channel);
 		} else {
 			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling);
 		}
@@ -562,7 +546,7 @@ ScalarFunction DuckDBPyConnection::CreateScalarUDF(const string &name, const py:
 	data.OverrideParameters(parameters);
 	data.OverrideReturnType(return_type);
 	data.Verify();
-	return data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties(), *connection.context);
+	return data.GetFunction(udf, exception_handling, side_effects, connection.context->GetClientProperties(), *connection.context, this->udf_channel);
 }
 
 } // namespace duckdb
