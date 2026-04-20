@@ -466,7 +466,7 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
 		                              name);
 	}
 
-	if (type == PythonUDFType::ARROW && !udf_channel) {
+	if (!udf_channel) {
 		D_ASSERT(py::gil_check());
 		udf_channel = make_shared_ptr<PythonUDFChannel>(
 			TaskScheduler::GetScheduler(context)

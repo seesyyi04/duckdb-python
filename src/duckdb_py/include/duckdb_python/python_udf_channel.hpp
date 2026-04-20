@@ -28,6 +28,9 @@ struct UDFBatch {
 	std::atomic<bool> done{false};
 	WaiterStack completion_waiters;
 	bool poison = false;
+	bool vectorized = true; // vectorized, not native
+	bool need_self = false; // default no self, mostly for scalar
+	std::string external_path;
 	ArrowSchema arrow_schema;
     ArrowArray arrow_array;
     ClientProperties client_props;
@@ -44,7 +47,7 @@ static constexpr std::size_t DEFAULT_CHANNEL_CAPACITY = 64;
 
 class PythonUDFChannel {
 	public:
-		PythonUDFChannel(TaskScheduler &scheduler, std::size_t buffer_capacity = DEFAULT_CHANNEL_CAPACITY);
+		PythonUDFChannel(TaskScheduler &scheduler, shared_ptr<DatabaseInstance> db, std::size_t buffer_capacity = DEFAULT_CHANNEL_CAPACITY);
 		~PythonUDFChannel();
 		
 		// Not copyabble or movable - Python thread holds references to internals
@@ -64,6 +67,8 @@ class PythonUDFChannel {
 
 		// PyObject *udf_func;
 		TaskScheduler &scheduler;
+		shared_ptr<DatabaseInstance> database;
+		unique_ptr<Connection> secondary_connection;
 
 		// C++ workers push input here and Python pops
 		MPSCRingBuffer<UDFBatch *, DEFAULT_CHANNEL_CAPACITY> input_buffer;

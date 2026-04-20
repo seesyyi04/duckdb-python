@@ -10,6 +10,7 @@
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb_python/python_conversion.hpp"
 
 #include <Python.h>
 #include <string>
@@ -17,6 +18,58 @@
 #include <chrono>
 
 namespace duckdb {
+
+using SteadyClock = std::chrono::steady_clock;
+using TimePoint = SteadyClock::time_point;
+
+static double UsElapsed(TimePoint start, TimePoint end) {
+	return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
+struct LoopProfile {
+	double gil_wait_us       = 0;  // blocked waiting for batches (GIL released)
+	double batch_collect_us  = 0;  // collecting additional batches from queue
+	double arrow_input_us    = 0;  // DuckDB DataChunk → PyArrow columns
+	double concat_us         = 0;  // pyarrow.concat_tables (concatenated path only)
+	double udf_exec_us      = 0;  // Python UDF execution
+	double arrow_output_us   = 0;  // PyArrow result → DuckDB vector (fast path)
+	double signal_us         = 0;  // SignalBatchDone overhead
+	idx_t  total_batches     = 0;
+	idx_t  total_rows        = 0;
+	idx_t  total_iterations  = 0;
+
+	void Print() const {
+		double total = gil_wait_us + batch_collect_us + arrow_input_us +
+		               concat_us + udf_exec_us + arrow_output_us + signal_us;
+		if (total == 0) return;
+
+		double busy = total - gil_wait_us;
+		double utilization = 100.0 * busy / total;
+
+		fprintf(stderr, "\n===== PythonUDFChannel Profile =====\n");
+		fprintf(stderr, "Iterations:       %llu\n", (unsigned long long)total_iterations);
+		fprintf(stderr, "Total batches:    %llu\n", (unsigned long long)total_batches);
+		fprintf(stderr, "Total rows:       %llu\n", (unsigned long long)total_rows);
+		fprintf(stderr, "-----------------------------------\n");
+		fprintf(stderr, "GIL wait:         %10.1f us  (%5.1f%%)\n", gil_wait_us,       100.0 * gil_wait_us / total);
+		fprintf(stderr, "Batch collect:    %10.1f us  (%5.1f%%)\n", batch_collect_us,  100.0 * batch_collect_us / total);
+		fprintf(stderr, "Arrow input:      %10.1f us  (%5.1f%%)\n", arrow_input_us,    100.0 * arrow_input_us / total);
+		fprintf(stderr, "Concat tables:    %10.1f us  (%5.1f%%)\n", concat_us,         100.0 * concat_us / total);
+		fprintf(stderr, "UDF execution:    %10.1f us  (%5.1f%%)\n", udf_exec_us,       100.0 * udf_exec_us / total);
+		fprintf(stderr, "Arrow output:     %10.1f us  (%5.1f%%)\n", arrow_output_us,   100.0 * arrow_output_us / total);
+		fprintf(stderr, "Signal:           %10.1f us  (%5.1f%%)\n", signal_us,         100.0 * signal_us / total);
+		fprintf(stderr, "-----------------------------------\n");
+		fprintf(stderr, "Total accounted:  %10.1f us\n", total);
+		fprintf(stderr, "Busy time:        %10.1f us\n", busy);
+		fprintf(stderr, "Idle time (wait): %10.1f us\n", gil_wait_us);
+		fprintf(stderr, "\n");
+		fprintf(stderr, ">>> Python thread utilization: %5.1f%% <<<\n", utilization);
+		fprintf(stderr, "    (UDF compute fraction:     %5.1f%%)\n", 100.0 * udf_exec_us / total);
+		fprintf(stderr, "    (Conversion overhead:      %5.1f%%)\n",
+		        100.0 * (arrow_input_us + concat_us + arrow_output_us) / total);
+		fprintf(stderr, "====================================\n\n");
+	}
+};
 
 static bool ExportToC(py::object &arr, ArrowArray &out) {
 	try {
@@ -132,8 +185,30 @@ static bool WriteResult(py::object &result, Vector &out_vec,
 		return true;
 	}
  
-	error_message = "Unsupported return type for fast path";
-	return false;
+	py::list result_list;
+	try {
+	    if (py::isinstance<py::list>(result)) {
+        	result_list = result;
+    	} else {
+        	result_list = result.attr("to_pylist")();
+    	}
+	} catch (...) {
+    	error_message = "Could not convert UDF result to list";
+    	return false;
+	}
+	if ((idx_t)py::len(result_list) != row_count) {
+    	error_message = "UDF returned wrong number of rows";
+    	return false;
+	}
+	for (idx_t i = 0; i < row_count; i++) {
+    	py::handle val = result_list[i];
+    	if (val.is_none()) {
+        	FlatVector::SetNull(out_vec, i, true);
+    	} else {
+        	TransformPythonObject(py::reinterpret_borrow<py::object>(val), out_vec, i);
+    	}
+	}
+	return true;
 }
 
 static py::object BatchToArrowTable(UDFBatch *batch) {
@@ -173,6 +248,16 @@ static py::object CallUDF(PyObject *func, py::tuple &columns,
 	return py::reinterpret_steal<py::object>(ret);
 }
 
+static py::tuple PrependSelf(py::object &udf_self, py::tuple &cols) {
+	idx_t n = py::len(cols);
+	py::tuple full_args(n + 1);
+	full_args[0] = udf_self;
+	for (idx_t i = 0; i < n; i++) {
+		full_args[i + 1] = cols[i];
+	}
+	return full_args;
+}
+
 static void SignalBatchDone(UDFBatch *batch) {
 	batch->done.store(true, std::memory_order_release);
 	auto *waiter = batch->completion_waiters.try_pop();
@@ -180,7 +265,9 @@ static void SignalBatchDone(UDFBatch *batch) {
 }
 
 PythonUDFChannel::PythonUDFChannel(TaskScheduler &scheduler, std::size_t buffer_capacity) 
-	: scheduler(scheduler) { }
+	: scheduler(scheduler), database(db) {
+		secondary_connection = make_uniq<Connection>(*database);
+	}
 
 PythonUDFChannel::~PythonUDFChannel() {
 	Stop();
@@ -189,7 +276,7 @@ PythonUDFChannel::~PythonUDFChannel() {
 }
 
 void PythonUDFChannel::Start() {
-	if (running.load()) { return; }
+	if (running.load()) return;
 	running.store(true);
 	python_thread = std::make_unique<std::thread>([this]() {
 		PythonThreadLoop();
@@ -224,7 +311,10 @@ std::string PythonUDFChannel::GetError() const {
  
 void PythonUDFChannel::PythonThreadLoop() {
 	static constexpr int MAX_BATCH_PER_GIL = 4;
+	LoopProfile prof;
 	PyGILState_STATE gstate = PyGILState_Ensure(); 
+
+	auto Now = []() { return SteadyClock::now(); };
 
 	PyObject *pa_module = PyImport_ImportModule("pyarrow");
 	if (!pa_module) {
@@ -238,14 +328,29 @@ void PythonUDFChannel::PythonThreadLoop() {
 	py::object concat = pa.attr("concat_tables");
 
 	while (running.load(std::memory_order_relaxed)) {
+		prof.total_iterations++;
+
+		// gil start
+		auto t_start = Now();
 		PyThreadState *tstate = PyEval_SaveThread();
 		auto first = input_buffer.blocking_pop();
 		PyEval_RestoreThread(tstate);
+		prof.gil_wait_us += UsElapsed(t_start, Now());
 
         if (!first.has_value()) continue;
         if (IsPoison(*first.value())) break;
 
+		py::dict ns;
+		py::exec(R"(
+			class UDFContext:
+				def __init__(self):
+					self.con = None
+					self.external_path = None
+		)", ns);
+		udf_self_object = ns["UDFContext"]();
+
 		// collect batches
+		t_start = Now();
 		vector<UDFBatch *> group;
 		group.reserve(MAX_BATCH_PER_GIL);
 		group.push_back(first.value());
@@ -255,65 +360,154 @@ void PythonUDFChannel::PythonThreadLoop() {
 			if (IsPoison(*extra.value())) break;
 			group.push_back(extra.value());
 		}
+		prof.batch_collect_us += UsElapsed(t_start, Now());
+		prof.total_batches += group.size();
 
 		bool should_exit = false;
 
-		try {
-			py::list tables;
-			vector<idx_t> row_counts;
-			row_counts.reserve(group.size());
-			for (auto *b : group) {
-				tables.append(BatchToArrowTable(b));
-				row_counts.push_back(b->input->size());
-			}
- 
-			py::object merged = concat(tables);
-			py::tuple cols(merged.attr("columns"));
- 
-			bool failed = false;
-			py::object full_result = CallUDF(group[0]->udf_func, cols,
-				                             error_message, &failed);
-			if (failed) {
+		if (group[0]->vectorized) {
+			try {
+				// arrow input 
+				fprintf(stderr, "[DEBUG] About to convert input\n");
+				t_start = Now();
+				py::list tables;
+				vector<idx_t> row_counts;
+				row_counts.reserve(group.size());
+				for (auto *b : group) {
+					tables.append(BatchToArrowTable(b));
+					row_counts.push_back(b->input->size());
+					prof.total_rows += b->input->size();
+				}
+				prof.arrow_input_us += UsElapsed(t_start, Now());
+	
+				// concat
+				fprintf(stderr, "[DEBUG] About to concat\n");
+				t_start = Now();
+				py::object merged = concat(tables);
+				py::tuple cols(merged.attr("columns"));
+				prof.concat_us += UsElapsed(t_start, Now());
+	
+				// udf execution
+				fprintf(stderr, "[DEBUG] About to call UDF\n");
+				t_start = Now();
+				bool failed = false;
+				py::object full_result = CallUDF(group[0]->udf_func, cols, error_message, &failed);
+				prof.udf_exec_us += UsElapsed(t_start, Now());
+	
+				if (failed) {
+					has_error.store(true, std::memory_order_release);
+					for (auto *b : group) SignalBatchDone(b);
+					should_exit = true;
+				} else {
+					// arrow output
+					LogicalTypeId tid = group[0]->return_type.id();
+					idx_t offset = 0;
+					bool is_list = py::isinstance<py::list>(full_result);
+					for (idx_t i = 0; i < group.size(); i++) {
+						auto *b = group[i];
+						idx_t rc = row_counts[i];
+	
+						t_start = Now();
+						b->result->SetCardinality(rc);
+						auto &vec = b->result->data[0];
+	 
+						py::object slice;
+        				if (is_list) {
+            				slice = full_result.attr("__getitem__")(py::slice(offset, offset + rc, 1));
+        				} else {
+        				    slice = full_result.attr("slice")(offset, rc);
+        				}
+
+						string err;
+						fprintf(stderr, "[DEBUG] WriteResult for type %d, rows=%llu\n", 
+        								(int)tid, (unsigned long long)rc);
+						if (!WriteResult(slice, vec, rc, tid, err)) {
+							fprintf(stderr, "[DEBUG] WriteResult FAILED: %s\n", err.c_str());
+							has_error.store(true, std::memory_order_release);
+							error_message = err;
+							for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
+							should_exit = true;
+							break;
+						}
+						vec.Flatten(rc);
+						prof.arrow_output_us += UsElapsed(t_start, Now());
+	
+						t_start = Now();
+						SignalBatchDone(b);
+						fprintf(stderr, "[DEBUG] SignalBatchDone for batch %llu\n", (unsigned long long)i);
+						prof.signal_us += UsElapsed(t_start, Now());
+						offset += rc;
+					}
+				}
+				fprintf(stderr, "[DEBUG] UDF returned, failed=%d\n", (int)failed);
+			} catch (const std::exception &e) {
+				fprintf(stderr, "[DEBUG] Exception in arrow path: %s\n", e.what());
 				has_error.store(true, std::memory_order_release);
+				error_message = std::string("C++ Exception: ") + e.what();
 				for (auto *b : group) SignalBatchDone(b);
 				should_exit = true;
-			} else {
-				LogicalTypeId tid = group[0]->return_type.id();
-				idx_t offset = 0;
-				for (idx_t i = 0; i < group.size(); i++) {
-					auto *b = group[i];
-					idx_t rc = row_counts[i];
-					b->result->SetCardinality(rc);
-					auto &vec = b->result->data[0];
- 
-					py::object slice = full_result.attr("slice")(offset, rc);
-					string err;
-					if (!WriteResult(slice, vec, rc, tid, err)) {
-						has_error.store(true, std::memory_order_release);
-						error_message = err;
-						for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
-						should_exit = true;
-						break;
-					}
-					vec.Flatten(rc);
-					SignalBatchDone(b);
-					offset += rc;
-				}
+			} catch (...) {
+				has_error.store(true, std::memory_order_release);
+				error_message = "Unknown C++ Exception";
+				for (auto *b : group) SignalBatchDone(b);
+				should_exit = true;
 			}
-		} catch (const std::exception &e) {
-			has_error.store(true, std::memory_order_release);
-			error_message = std::string("C++ Exception: ") + e.what();
-			for (auto *b : group) SignalBatchDone(b);
-			should_exit = true;
-		} catch (...) {
-			has_error.store(true, std::memory_order_release);
-			error_message = "Unknown C++ Exception";
-			for (auto *b : group) SignalBatchDone(b);
-			should_exit = true;
+		} else {
+			for (auto *batch : group) {
+				try {
+					DataChunk *input = batch->input;
+					DataChunk *result_chunk = batch->result;
+					idx_t row_count = input->size();
+					result_chunk->SetCardinality(row_count);
+					auto &out_vec = result_chunk->data[0];
+		
+					for (idx_t row = 0; row < row_count; row++) {
+						idx_t col_count = input->ColumnCount();
+						py::tuple args(col_count);
+						bool has_null = false;
+						for (idx_t c = 0; c < col_count; c++) {
+							auto value = input->data[c].GetValue(row);
+							if (value.IsNull()) {
+								FlatVector::SetNull(out_vec, row, true);
+								has_null = true;
+								break;
+							}
+							args[c] = PythonObject::FromValue(value, input->data[c].GetType(),
+													   batch->client_props);
+						}
+						{
+							if (has_null) continue;
+							auto ret = py::reinterpret_steal<py::object>(
+							PyObject_CallObject(batch->udf_func, args.ptr()));
+							if (!ret || ret.is_none()) {
+								if (PyErr_Occurred()) { PyErr_Clear(); }
+								FlatVector::SetNull(out_vec, row, true);
+							} else {
+								TransformPythonObject(ret, out_vec, row);
+							}
+						}
+					}
+					SignalBatchDone(batch);
+				} catch (const std::exception &e) {
+            		has_error.store(true, std::memory_order_release);
+            		error_message = std::string("C++ Exception: ") + e.what();
+            		SignalBatchDone(batch);
+            		should_exit = true;
+            		break;
+        		} catch (...) {
+            		has_error.store(true, std::memory_order_release);
+            		error_message = "Unknown C++ Exception";
+            		SignalBatchDone(batch);
+            		should_exit = true;
+            		break;
+        		}
+			}
 		}
+
 		if (should_exit) break;
 	}
-	Py_DECREF(pa_module);
+	prof.Print();
+	Py_XDECREF(pa_module);
 	PyGILState_Release(gstate);
 }
 

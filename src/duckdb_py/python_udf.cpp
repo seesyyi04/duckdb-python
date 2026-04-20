@@ -309,69 +309,55 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 	return func;
 }
 
-static scalar_function_t CreateNativeFunction(PyObject *function, PythonExceptionHandling exception_handling,
+static scalar_function_t CreateNativeFunction(PyObject *function,
+                                              PythonExceptionHandling exception_handling,
                                               const ClientProperties &client_properties,
-                                              FunctionNullHandling null_handling) {
+                                              FunctionNullHandling null_handling,
+                                              shared_ptr<PythonUDFChannel> channel) {
 	// Through the capture of the lambda, we have access to the function pointer
 	// We just need to make sure that it doesn't get garbage collected
-	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void { // NOLINT
-		py::gil_scoped_acquire gil;
+	scalar_function_t func = [=](DataChunk &input, ExpressionState &state,
+                                  Vector &result) -> void {
+        auto &context = state.GetContext();
+        auto &scheduler = TaskScheduler::GetScheduler(context);
 
-		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
+		auto input_copy = make_uniq<DataChunk>();
+    	input_copy->Initialize(Allocator::Get(context), input.GetTypes(), STANDARD_VECTOR_SIZE);
+    	for (idx_t c = 0; c < input.ColumnCount(); c++) {
+        	VectorOperations::Copy(input.data[c], input_copy->data[c], input.size(), 0, 0);
+    	}
+    	input_copy->SetCardinality(input.size());
 
-		for (idx_t row = 0; row < input.size(); row++) {
+        auto result_chunk = make_uniq<DataChunk>();
+        result_chunk->Initialize(Allocator::Get(context), {result.GetType()},
+                                 STANDARD_VECTOR_SIZE);
 
-			py::object ret;
-			if (input.ColumnCount() > 0) {
-				auto bundled_parameters = py::tuple((int)input.ColumnCount());
-				bool contains_null = false;
-				for (idx_t i = 0; i < input.ColumnCount(); i++) {
-					// Fill the tuple with the arguments for this row
-					auto &column = input.data[i];
-					auto value = column.GetValue(row);
-					if (value.IsNull() && default_null_handling) {
-						contains_null = true;
-						break;
-					}
-					bundled_parameters[i] = PythonObject::FromValue(value, column.GetType(), client_properties);
-				}
-				if (contains_null) {
-					// Immediately insert None, no need to call the function
-					FlatVector::SetNull(result, row, true);
-					continue;
-				}
-				// Call the function
-				ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, bundled_parameters.ptr()));
-			} else {
-				ret = py::reinterpret_steal<py::object>(PyObject_CallObject(function, nullptr));
-			}
+        UDFBatch batch;
+        batch.input = &input;
+        batch.context = &context;
+        batch.result = result_chunk.get();
+        batch.udf_func = function;
+        batch.return_type = result.GetType();
+        batch.vectorized = false;  // native row-by-row path
+        batch.client_props = context.GetClientProperties();
+        batch.done.store(false);
 
-			if (!ret || ret.is_none()) {
-				if (PyErr_Occurred()) {
-					if (exception_handling == PythonExceptionHandling::FORWARD_ERROR) {
-						auto exception = py::error_already_set();
-						throw InvalidInputException("Python exception occurred while executing the UDF: %s",
-						                            exception.what());
-					}
-					if (exception_handling == PythonExceptionHandling::RETURN_NULL) {
-						PyErr_Clear();
-						FlatVector::SetNull(result, row, true);
-						continue;
-					}
-					throw NotImplementedException("Exception handling type not implemented");
-				}
-				if (default_null_handling) {
-					throw InvalidInputException(NullHandlingError());
-				}
-			}
-			TransformPythonObject(ret, result, row);
-		}
+        PythonUDFTask task(*channel, batch);
+        auto coroutine = task.ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
+        coroutine.set_scheduler(&scheduler);
+        coroutine.resume();
 
-		if (input.size() == 1) {
-			result.SetVectorType(VectorType::CONSTANT_VECTOR);
-		}
-	};
-	return func;
+        WaitForCoroutineWithWorkStealing(batch, scheduler);
+
+        if (channel->HasError()) {
+            throw InvalidInputException("Python UDF error: %s",
+                                         channel->GetError());
+        }
+
+        VectorOperations::Copy(result_chunk->data[0], result,
+                               input.size(), 0, 0);
+    };
+    return func;
 }
 
 namespace {
@@ -522,7 +508,7 @@ struct PythonUDFData {
 		if (vectorized) {
 			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, channel);
 		} else {
-			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling);
+			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling, channel);
 		}
 		FunctionStability function_side_effects =
 		    side_effects ? FunctionStability::VOLATILE : FunctionStability::CONSISTENT;
