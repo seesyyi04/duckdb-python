@@ -16,6 +16,8 @@
 #include <thread>
 #include <memory>
 #include <string>
+#include <mutex>
+#include <condition_variable>
 
 namespace duckdb {
 
@@ -30,6 +32,8 @@ struct UDFBatch {
 	LogicalType return_type; 
 	std::atomic<bool> done{false};
 	WaiterStack completion_waiters;
+	std::mutex done_mutex;
+	std::condition_variable done_cv;
 	bool poison = false;
 	bool vectorized = true; // vectorized, not native
 	bool need_self = false; // default no self, mostly for scalar

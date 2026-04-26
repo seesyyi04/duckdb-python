@@ -375,6 +375,7 @@ static void SignalBatchDone(UDFBatch *batch) {
 	batch->done.store(true, std::memory_order_release);
 	auto *waiter = batch->completion_waiters.try_pop();
 	if (waiter) { waiter->self_handle.resume(); }
+	batch->done_cv.notify_all();
 }
 
 PythonUDFChannel::PythonUDFChannel(TaskScheduler &scheduler, shared_ptr<DuckDB> db,
@@ -421,7 +422,7 @@ std::string PythonUDFChannel::GetError() const {
 }
  
 void PythonUDFChannel::PythonThreadLoop() {
-	static constexpr int MAX_BATCH_PER_GIL = 4;
+	static constexpr int MAX_BATCH_PER_GIL = 32;
 	LoopProfile prof;
 	PyGILState_STATE gstate = PyGILState_Ensure(); 
 

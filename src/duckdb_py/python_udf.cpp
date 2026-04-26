@@ -191,7 +191,10 @@ static void WaitForCoroutineWithWorkStealing(UDFBatch &batch, TaskScheduler &sch
 			}
 			continue;
 		}
-		TaskScheduler::YieldThread();
+		std::unique_lock<std::mutex> lock(batch.done_mutex);
+		batch.done_cv.wait_for(lock, std::chrono::microseconds(10), [&]() {
+			return batch.done.load(std::memory_order_acquire);
+		});
 	}
 }
 
