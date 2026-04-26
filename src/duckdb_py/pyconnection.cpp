@@ -468,8 +468,11 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
 
 	if (!udf_channel) {
 		D_ASSERT(py::gil_check());
+		std::string db_path = connection.context->db->config.options.database_path;
 		udf_channel = make_shared_ptr<PythonUDFChannel>(
-			TaskScheduler::GetScheduler(context)
+			TaskScheduler::GetScheduler(context),
+			con.GetDatabaseShared(),
+			db_path
 		);
 		udf_channel->Start();
 	}
@@ -478,7 +481,10 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
 	                                       null_handling, exception_handling, side_effects);
 	CreateScalarFunctionInfo info(scalar_function);
 
-	context.RegisterFunction(info);
+	context.transaction.BeginTransaction();
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	catalog.CreateFunction(context, info);
+	context.transaction.Commit();
 
 	auto dependency = make_uniq<ExternalDependency>();
 	dependency->AddDependency("function", PythonDependencyItem::Create(udf));

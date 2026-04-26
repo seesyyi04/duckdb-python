@@ -74,6 +74,11 @@ public:
 	}
 
 public:
+    shared_ptr<DuckDB> GetDatabaseShared() {
+ 		if (!database) ThrowConnectionException();
+		return database;
+	}
+
 	DuckDB &GetDatabase() {
 		if (!database) {
 			ThrowConnectionException();
@@ -296,6 +301,10 @@ public:
 	shared_ptr<DuckDBPyConnection> Rollback();
 
 	shared_ptr<DuckDBPyConnection> Checkpoint();
+
+	shared_ptr<DuckDB> GetDatabaseShared() {
+		return con.GetDatabaseShared();
+	}
 
 	void Close();
 

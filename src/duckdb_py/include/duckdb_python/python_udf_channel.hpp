@@ -8,11 +8,14 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <Python.h>
 #include <atomic>
 #include <thread>
 #include <memory>
+#include <string>
 
 namespace duckdb {
 
@@ -47,16 +50,14 @@ static constexpr std::size_t DEFAULT_CHANNEL_CAPACITY = 64;
 
 class PythonUDFChannel {
 	public:
-		PythonUDFChannel(TaskScheduler &scheduler, shared_ptr<DatabaseInstance> db, std::size_t buffer_capacity = DEFAULT_CHANNEL_CAPACITY);
+		PythonUDFChannel(TaskScheduler &scheduler, shared_ptr<DuckDB> db, 
+						 const std::string &db_path, std::size_t buffer_capacity = DEFAULT_CHANNEL_CAPACITY);
 		~PythonUDFChannel();
 		
-		// Not copyabble or movable - Python thread holds references to internals
 		PythonUDFChannel(const PythonUDFChannel &) = delete;
 		PythonUDFChannel &operator=(const PythonUDFChannel &) = delete;
 
-		// start python executor thread
 		void Start();
-		// signal shutdown, join the python thread
 		void Stop();
 		bool HasError() const;
 		std::string GetError() const;
@@ -65,10 +66,9 @@ class PythonUDFChannel {
 	private:
 		void PythonThreadLoop();
 
-		// PyObject *udf_func;
 		TaskScheduler &scheduler;
-		shared_ptr<DatabaseInstance> database;
-		unique_ptr<Connection> secondary_connection;
+		shared_ptr<DuckDB> database;
+		std::string database_path;
 
 		// C++ workers push input here and Python pops
 		MPSCRingBuffer<UDFBatch *, DEFAULT_CHANNEL_CAPACITY> input_buffer;

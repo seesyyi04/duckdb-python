@@ -1,7 +1,8 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb_python/python_udf_channel.hpp"
 #include "duckdb/main/client_context.hpp"
-
+#include "duckdb_python/python_conversion.hpp"
+ 
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -10,12 +11,14 @@
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "duckdb_python/python_conversion.hpp"
+#include "duckdb_python/pyconnection/pyconnection.hpp"
 
 #include <Python.h>
 #include <string>
 #include <vector>
+#include <cstring>
 #include <chrono>
+#include <cstdio>
 
 namespace duckdb {
 
@@ -46,28 +49,29 @@ struct LoopProfile {
 		double busy = total - gil_wait_us;
 		double utilization = 100.0 * busy / total;
 
-		fprintf(stderr, "\n===== PythonUDFChannel Profile =====\n");
-		fprintf(stderr, "Iterations:       %llu\n", (unsigned long long)total_iterations);
-		fprintf(stderr, "Total batches:    %llu\n", (unsigned long long)total_batches);
-		fprintf(stderr, "Total rows:       %llu\n", (unsigned long long)total_rows);
-		fprintf(stderr, "-----------------------------------\n");
-		fprintf(stderr, "GIL wait:         %10.1f us  (%5.1f%%)\n", gil_wait_us,       100.0 * gil_wait_us / total);
-		fprintf(stderr, "Batch collect:    %10.1f us  (%5.1f%%)\n", batch_collect_us,  100.0 * batch_collect_us / total);
-		fprintf(stderr, "Arrow input:      %10.1f us  (%5.1f%%)\n", arrow_input_us,    100.0 * arrow_input_us / total);
-		fprintf(stderr, "Concat tables:    %10.1f us  (%5.1f%%)\n", concat_us,         100.0 * concat_us / total);
-		fprintf(stderr, "UDF execution:    %10.1f us  (%5.1f%%)\n", udf_exec_us,       100.0 * udf_exec_us / total);
-		fprintf(stderr, "Arrow output:     %10.1f us  (%5.1f%%)\n", arrow_output_us,   100.0 * arrow_output_us / total);
-		fprintf(stderr, "Signal:           %10.1f us  (%5.1f%%)\n", signal_us,         100.0 * signal_us / total);
-		fprintf(stderr, "-----------------------------------\n");
-		fprintf(stderr, "Total accounted:  %10.1f us\n", total);
-		fprintf(stderr, "Busy time:        %10.1f us\n", busy);
-		fprintf(stderr, "Idle time (wait): %10.1f us\n", gil_wait_us);
-		fprintf(stderr, "\n");
-		fprintf(stderr, ">>> Python thread utilization: %5.1f%% <<<\n", utilization);
-		fprintf(stderr, "    (UDF compute fraction:     %5.1f%%)\n", 100.0 * udf_exec_us / total);
-		fprintf(stderr, "    (Conversion overhead:      %5.1f%%)\n",
+		fprintf(stdout, "\n===== PythonUDFChannel Profile =====\n");
+		fprintf(stdout, "Iterations:       %llu\n", (unsigned long long)total_iterations);
+		fprintf(stdout, "Total batches:    %llu\n", (unsigned long long)total_batches);
+		fprintf(stdout, "Total rows:       %llu\n", (unsigned long long)total_rows);
+		fprintf(stdout, "-----------------------------------\n");
+		fprintf(stdout, "GIL wait:         %10.1f us  (%5.1f%%)\n", gil_wait_us,       100.0 * gil_wait_us / total);
+		fprintf(stdout, "Batch collect:    %10.1f us  (%5.1f%%)\n", batch_collect_us,  100.0 * batch_collect_us / total);
+		fprintf(stdout, "Arrow input:      %10.1f us  (%5.1f%%)\n", arrow_input_us,    100.0 * arrow_input_us / total);
+		fprintf(stdout, "Concat tables:    %10.1f us  (%5.1f%%)\n", concat_us,         100.0 * concat_us / total);
+		fprintf(stdout, "UDF execution:    %10.1f us  (%5.1f%%)\n", udf_exec_us,       100.0 * udf_exec_us / total);
+		fprintf(stdout, "Arrow output:     %10.1f us  (%5.1f%%)\n", arrow_output_us,   100.0 * arrow_output_us / total);
+		fprintf(stdout, "Signal:           %10.1f us  (%5.1f%%)\n", signal_us,         100.0 * signal_us / total);
+		fprintf(stdout, "-----------------------------------\n");
+		fprintf(stdout, "Total accounted:  %10.1f us\n", total);
+		fprintf(stdout, "Busy time:        %10.1f us\n", busy);
+		fprintf(stdout, "Idle time (wait): %10.1f us\n", gil_wait_us);
+		fprintf(stdout, "\n");
+		fprintf(stdout, ">>> Python thread utilization: %5.1f%% <<<\n", utilization);
+		fprintf(stdout, "    (UDF compute fraction:     %5.1f%%)\n", 100.0 * udf_exec_us / total);
+		fprintf(stdout, "    (Conversion overhead:      %5.1f%%)\n",
 		        100.0 * (arrow_input_us + concat_us + arrow_output_us) / total);
-		fprintf(stderr, "====================================\n\n");
+		fprintf(stdout, "====================================\n\n");
+		fflush(stdout);
 	}
 };
 
@@ -97,92 +101,201 @@ static void ReleaseArrow(ArrowSchema &s) {
 	if (s.release) { s.release(&s); }
 }
 
+static bool WriteArrowToVector(const ArrowArray &arrow, const ArrowSchema &schema, Vector &out_vec, idx_t row_count, idx_t extra_offset = 0);
+
 // Arrow validity bitmap --> DuckDB validity mask
-static void TransferValidity(const ArrowArray &arrow, Vector &out_vec, idx_t row_count) {
+static void validity(const ArrowArray &arrow, Vector &out_vec, idx_t row_count, idx_t offset) {
 	const auto *bitmap = static_cast<const uint8_t *>(arrow.buffers[0]);
 	if (!bitmap) return;
- 
-	idx_t off = static_cast<idx_t>(arrow.offset);
 	auto &validity = FlatVector::Validity(out_vec);
 	for (idx_t i = 0; i < row_count; i++) {
-		idx_t src = off + i;
+		idx_t src = offset + i;
 		if (!((bitmap[src / 8] >> (src % 8)) & 1)) {
 			validity.SetInvalid(i);
 		}
 	}
 }
 
-// fast-path writers (BIGINT, DOUBLE, VARCHAR)
-static void WriteBigint(const ArrowArray &arrow, Vector &out_vec, idx_t row_count) {
-	idx_t off = static_cast<idx_t>(arrow.offset);
-	const auto *src = static_cast<const int64_t *>(arrow.buffers[1]) + off;
-	memcpy(FlatVector::GetData<int64_t>(out_vec), src, row_count * sizeof(int64_t));
-	TransferValidity(arrow, out_vec, row_count);
-}
+static bool WriteArrowToVector(const ArrowArray &arrow, const ArrowSchema &schema, Vector &out_vec, idx_t row_count, idx_t extra_offset) {
+	if (!schema.format) return false;
+	idx_t off = static_cast<idx_t>(arrow.offset) + extra_offset;
+	const char *fmt = schema.format;
 
-static void WriteDouble(const ArrowArray &arrow, Vector &out_vec, idx_t row_count) {
-	idx_t off = static_cast<idx_t>(arrow.offset);
-	const auto *src = static_cast<const double *>(arrow.buffers[1]) + off;
-	memcpy(FlatVector::GetData<double>(out_vec), src, row_count * sizeof(double));
-	TransferValidity(arrow, out_vec, row_count);
-}
-
-static void WriteVarchar(const ArrowArray &arrow, const ArrowSchema &schema,
-                         Vector &out_vec, idx_t row_count) {
-	idx_t off = static_cast<idx_t>(arrow.offset);
-	const auto *char_data = static_cast<const char *>(arrow.buffers[2]);
-	if (!char_data) { char_data = ""; }
- 
-	bool large = schema.format && schema.format[0] == 'U';
-	if (large) {
-		const auto *offsets = static_cast<const int64_t *>(arrow.buffers[1]) + off;
-		for (idx_t i = 0; i < row_count; i++) {
-			StringVector::AddString(out_vec, char_data + offsets[i],
-			                        static_cast<idx_t>(offsets[i + 1] - offsets[i]));
-		}
-	} else {
-		const auto *offsets = static_cast<const int32_t *>(arrow.buffers[1]) + off;
-		for (idx_t i = 0; i < row_count; i++) {
-			StringVector::AddString(out_vec, char_data + offsets[i],
-			                        static_cast<idx_t>(offsets[i + 1] - offsets[i]));
+	if (fmt[1] == '\0') {
+		switch (fmt[0]) {
+			case 'c': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<int8_t>(out_vec),
+					   static_cast<const int8_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(int8_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 's': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<int16_t>(out_vec),
+					   static_cast<const int16_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(int16_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'i': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<int32_t>(out_vec),
+					   static_cast<const int32_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(int32_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'l': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<int64_t>(out_vec),
+					   static_cast<const int64_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(int64_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'C': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<uint8_t>(out_vec),
+					   static_cast<const uint8_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(uint8_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'S': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<uint16_t>(out_vec),
+					   static_cast<const uint16_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(uint16_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'I': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<uint32_t>(out_vec),
+					   static_cast<const uint32_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(uint32_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'L': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<uint64_t>(out_vec),
+					   static_cast<const uint64_t *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(uint64_t));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'f': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<float>(out_vec),
+					   static_cast<const float *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(float));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			case 'g': {
+				if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+				memcpy(FlatVector::GetData<double>(out_vec),
+					   static_cast<const double *>(arrow.buffers[1]) + off,
+					   row_count * sizeof(double));
+				validity(arrow, out_vec, row_count, off);
+				return true;
+			}
+			default:
+				break;
 		}
 	}
-	TransferValidity(arrow, out_vec, row_count);
+
+	if ((fmt[0] == 'u' || fmt[0] == 'U') && fmt[1] == '\0') {
+		if (arrow.n_buffers < 3) return false;
+		const auto *char_data = static_cast<const char *>(arrow.buffers[2]);
+		if (!char_data) char_data = "";
+
+		if (fmt[0] == 'U') {
+			const auto *offsets = static_cast<const int64_t *>(arrow.buffers[1]) + off;
+			for (idx_t i = 0; i < row_count; i++) {
+				StringVector::AddString(out_vec, char_data + offsets[i], static_cast<idx_t>(offsets[i + 1] - offsets[i]));
+			}
+		} else {
+			const auto *offsets = static_cast<const int32_t *>(arrow.buffers[1]) + off;
+			for (idx_t i = 0; i < row_count; i++) {
+				StringVector::AddString(out_vec, char_data + offsets[i], static_cast<idx_t>(offsets[i + 1] - offsets[i]));
+			}
+		}
+		validity(arrow, out_vec, row_count, off);
+		return true;
+	}
+
+	if (fmt[0] == '+' && fmt[1] == 's') {
+		if (arrow.n_children < 1) return false;
+		auto &child_vectors = StructVector::GetEntries(out_vec);
+		if ((idx_t)arrow.n_children != child_vectors.size()) return false;
+
+		for (idx_t c = 0; c < (idx_t)arrow.n_children; c++) {
+			if (!arrow.children[c] || !schema.children[c]) return false;
+			if (!WriteArrowToVector(*arrow.children[c], *schema.children[c], *child_vectors[c], row_count, extra_offset)) {
+				return false;
+			}
+		}
+		validity(arrow, out_vec, row_count, off);
+		return true;
+	}
+
+	if (fmt[0] == '+' && (fmt[1] == 'l' || fmt[1] == 'L')) {
+		if (arrow.n_children < 1 || !arrow.children[0] || !schema.children[0]) return false;
+		if (arrow.n_buffers < 2 || !arrow.buffers[1]) return false;
+		auto &child_vec = ListVector::GetEntry(out_vec);
+		auto list_data = FlatVector::GetData<list_entry_t>(out_vec);
+		idx_t total_child_count = 0;
+
+		if (fmt[1] == 'L') {
+			const auto *offsets = static_cast<const int64_t *>(arrow.buffers[1]) + off;
+			for (idx_t i = 0; i < row_count; i++) {
+				idx_t start = static_cast<idx_t>(offsets[i]);
+				idx_t len = static_cast<idx_t>(offsets[i + 1] - offsets[i]);
+				list_data[i].offset = start;
+				list_data[i].length = len;
+				total_child_count += len;
+			}
+		} else {
+			const auto *offsets = static_cast<const int32_t *>(arrow.buffers[1]) + off;
+			for (idx_t i = 0; i < row_count; i++) {
+				idx_t start = static_cast<idx_t>(offsets[i]);
+				idx_t len = static_cast<idx_t>(offsets[i + 1] - offsets[i]);
+				list_data[i].offset = start;
+				list_data[i].length = len;
+				total_child_count += len;
+			}
+		}
+		ListVector::SetListSize(out_vec, total_child_count);
+		ListVector::Reserve(out_vec, total_child_count);
+		if (total_child_count > 0) {
+			if (!WriteArrowToVector(*arrow.children[0], *schema.children[0], child_vec, total_child_count, extra_offset)) {
+				return false;
+			}
+		}
+		validity(arrow, out_vec, row_count, off);
+		return true;
+	}
+	return false;
 }
 
 // Pyarrow result --> write into DuckDB vector
-static bool WriteResult(py::object &result, Vector &out_vec,
-                        idx_t row_count, LogicalTypeId type_id,
-                        string &error_message) {
-	if (type_id == LogicalTypeId::BIGINT || type_id == LogicalTypeId::DOUBLE) {
-		ArrowArray arrow;
-		memset(&arrow, 0, sizeof(arrow));
-		if (!ExportToC(result, arrow)) {
-			error_message = "Failed to export PyArrow array via C Data Interface";
-			return false;
-		}
-		if (type_id == LogicalTypeId::BIGINT) {
-			WriteBigint(arrow, out_vec, row_count);
-		} else {
-			WriteDouble(arrow, out_vec, row_count);
-		}
-		ReleaseArrow(arrow);
-		return true;
-	}
+static bool WriteResult(py::object &result, Vector &out_vec, idx_t row_count, LogicalTypeId type_id, string &error_message) {
  
-	if (type_id == LogicalTypeId::VARCHAR) {
+	if (!py::isinstance<py::list>(result)) {
 		ArrowArray arrow;
 		ArrowSchema schema;
 		memset(&arrow, 0, sizeof(arrow));
 		memset(&schema, 0, sizeof(schema));
-		if (!ExportToCWithSchema(result, arrow, schema)) {
-			error_message = "Failed to export PyArrow string array via C Data Interface";
-			return false;
+		if (ExportToCWithSchema(result, arrow, schema)) {
+			bool ok = WriteArrowToVector(arrow, schema, out_vec, row_count);
+			ReleaseArrow(arrow);
+			ReleaseArrow(schema);
+			if (ok) return true;
 		}
-		WriteVarchar(arrow, schema, out_vec, row_count);
-		ReleaseArrow(arrow);
-		ReleaseArrow(schema);
-		return true;
 	}
  
 	py::list result_list;
@@ -264,15 +377,13 @@ static void SignalBatchDone(UDFBatch *batch) {
 	if (waiter) { waiter->self_handle.resume(); }
 }
 
-PythonUDFChannel::PythonUDFChannel(TaskScheduler &scheduler, std::size_t buffer_capacity) 
-	: scheduler(scheduler), database(db) {
-		secondary_connection = make_uniq<Connection>(*database);
+PythonUDFChannel::PythonUDFChannel(TaskScheduler &scheduler, shared_ptr<DuckDB> db,
+                                   const std::string &db_path, std::size_t buffer_capacity) 
+	: scheduler(scheduler), database(db), database_path(db_path) {
 	}
 
 PythonUDFChannel::~PythonUDFChannel() {
 	Stop();
-	PyGILState_STATE gstate = PyGILState_Ensure();
-	PyGILState_Release(gstate);
 }
 
 void PythonUDFChannel::Start() {
@@ -327,6 +438,27 @@ void PythonUDFChannel::PythonThreadLoop() {
 	py::object pa = py::reinterpret_borrow<py::object>(pa_module);
 	py::object concat = pa.attr("concat_tables");
 
+	py::object udf_self;
+	try {
+		py::object types_mod = py::module::import("types");
+    	udf_self = types_mod.attr("SimpleNamespace")();
+
+		auto py_conn = make_shared_ptr<DuckDBPyConnection>();
+		{
+			py::gil_scoped_release release;
+			py_conn->con.SetDatabase(database);
+			py_conn->con.SetConnection(make_uniq<Connection>(py_conn->con.GetDatabase()));
+		}
+		udf_self.attr("con") = py::cast(py_conn);
+		udf_self.attr("external_path") = "";
+	} catch (const std::exception &e) {
+		fprintf(stderr, "[WARN] Could not create UDF self object: %s\n", e.what());
+		udf_self = py::none();
+	} catch (...) {
+		fprintf(stderr, "[WARN] Could not create UDF self object\n");
+		udf_self = py::none();
+	}
+
 	while (running.load(std::memory_order_relaxed)) {
 		prof.total_iterations++;
 
@@ -339,15 +471,6 @@ void PythonUDFChannel::PythonThreadLoop() {
 
         if (!first.has_value()) continue;
         if (IsPoison(*first.value())) break;
-
-		py::dict ns;
-		py::exec(R"(
-			class UDFContext:
-				def __init__(self):
-					self.con = None
-					self.external_path = None
-		)", ns);
-		udf_self_object = ns["UDFContext"]();
 
 		// collect batches
 		t_start = Now();
@@ -363,12 +486,20 @@ void PythonUDFChannel::PythonThreadLoop() {
 		prof.batch_collect_us += UsElapsed(t_start, Now());
 		prof.total_batches += group.size();
 
+		has_error.store(false, std::memory_order_release);
+		error_message.clear();
+
 		bool should_exit = false;
+
+		if (!udf_self.is_none() && group[0]->need_self && !group[0]->external_path.empty()) {
+			try {
+				udf_self.attr("external_path") = group[0]->external_path;
+			} catch (...) {}
+		}
 
 		if (group[0]->vectorized) {
 			try {
 				// arrow input 
-				fprintf(stderr, "[DEBUG] About to convert input\n");
 				t_start = Now();
 				py::list tables;
 				vector<idx_t> row_counts;
@@ -381,17 +512,19 @@ void PythonUDFChannel::PythonThreadLoop() {
 				prof.arrow_input_us += UsElapsed(t_start, Now());
 	
 				// concat
-				fprintf(stderr, "[DEBUG] About to concat\n");
 				t_start = Now();
 				py::object merged = concat(tables);
 				py::tuple cols(merged.attr("columns"));
 				prof.concat_us += UsElapsed(t_start, Now());
 	
 				// udf execution
-				fprintf(stderr, "[DEBUG] About to call UDF\n");
 				t_start = Now();
 				bool failed = false;
-				py::object full_result = CallUDF(group[0]->udf_func, cols, error_message, &failed);
+				py::tuple call_args = cols;
+				if (group[0]->need_self && !udf_self.is_none()) {
+					call_args = PrependSelf(udf_self, cols);
+				}
+				py::object full_result = CallUDF(group[0]->udf_func, call_args, error_message, &failed);
 				prof.udf_exec_us += UsElapsed(t_start, Now());
 	
 				if (failed) {
@@ -400,48 +533,119 @@ void PythonUDFChannel::PythonThreadLoop() {
 					should_exit = true;
 				} else {
 					// arrow output
-					LogicalTypeId tid = group[0]->return_type.id();
-					idx_t offset = 0;
-					bool is_list = py::isinstance<py::list>(full_result);
-					for (idx_t i = 0; i < group.size(); i++) {
-						auto *b = group[i];
-						idx_t rc = row_counts[i];
-	
-						t_start = Now();
-						b->result->SetCardinality(rc);
-						auto &vec = b->result->data[0];
-	 
-						py::object slice;
-        				if (is_list) {
-            				slice = full_result.attr("__getitem__")(py::slice(offset, offset + rc, 1));
-        				} else {
-        				    slice = full_result.attr("slice")(offset, rc);
-        				}
-
-						string err;
-						fprintf(stderr, "[DEBUG] WriteResult for type %d, rows=%llu\n", 
-        								(int)tid, (unsigned long long)rc);
-						if (!WriteResult(slice, vec, rc, tid, err)) {
-							fprintf(stderr, "[DEBUG] WriteResult FAILED: %s\n", err.c_str());
-							has_error.store(true, std::memory_order_release);
-							error_message = err;
-							for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
-							should_exit = true;
-							break;
-						}
-						vec.Flatten(rc);
-						prof.arrow_output_us += UsElapsed(t_start, Now());
-	
-						t_start = Now();
-						SignalBatchDone(b);
-						fprintf(stderr, "[DEBUG] SignalBatchDone for batch %llu\n", (unsigned long long)i);
-						prof.signal_us += UsElapsed(t_start, Now());
-						offset += rc;
+					if (py::isinstance<py::list>(full_result)) {
+						try {
+							LogicalTypeId tid = group[0]->return_type.id();
+							py::object pa_type = py::none();
+							if (tid == LogicalTypeId::STRUCT) {
+								auto &children = StructType::GetChildTypes(group[0]->return_type);
+								py::list fields;
+								for (auto &child : children) {
+									py::object field_type;
+									switch (child.second.id()) {
+										case LogicalTypeId::DOUBLE:  field_type = pa.attr("float64")(); break;
+										case LogicalTypeId::BIGINT:  field_type = pa.attr("int64")(); break;
+										case LogicalTypeId::INTEGER: field_type = pa.attr("int32")(); break;
+										case LogicalTypeId::VARCHAR: field_type = pa.attr("utf8")(); break;
+										default: throw std::runtime_error("unsupported child type");
+									}
+									fields.append(pa.attr("field")(child.first, field_type));
+								}
+								pa_type = pa.attr("struct")(fields);
+							} else if (tid == LogicalTypeId::BIGINT) {
+								pa_type = pa.attr("int64")();
+							} else if (tid == LogicalTypeId::DOUBLE) {
+								pa_type = pa.attr("float64")();
+							} else if (tid == LogicalTypeId::VARCHAR) {
+								pa_type = pa.attr("utf8")();
+							}
+							if (!pa_type.is_none()) {
+								full_result = pa.attr("array")(full_result, py::arg("type") = pa_type);
+							}
+						} catch (...) {} 
 					}
+
+					auto t_out_start = Now();
+					LogicalTypeId tid = group[0]->return_type.id();
+					bool is_list_result = py::isinstance<py::list>(full_result);
+
+					if (!is_list_result) {
+						ArrowArray full_arrow;
+						ArrowSchema full_schema;
+						memset(&full_arrow, 0, sizeof(full_arrow));
+						memset(&full_schema, 0, sizeof(full_schema));
+
+						bool exported = ExportToCWithSchema(full_result, full_arrow, full_schema);
+						if (exported) {
+							idx_t batch_offset = 0;
+							for (idx_t i = 0; i < group.size(); i++) {
+								auto *b = group[i];
+								idx_t rc = row_counts[i];
+								b->result->SetCardinality(rc);
+								auto &vec = b->result->data[0];
+
+								bool ok = WriteArrowToVector(full_arrow, full_schema, vec, rc, batch_offset);
+								vec.Flatten(rc);
+
+								if (!ok) {
+									has_error.store(true, std::memory_order_release);
+									error_message = "Failed to write Arrow result to vector";
+									for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
+									should_exit = true;
+									break;
+								}
+								SignalBatchDone(b);
+								batch_offset += rc;
+							}
+							ReleaseArrow(full_arrow);
+							ReleaseArrow(full_schema);
+						} else {
+							idx_t offset = 0;
+							for (idx_t i = 0; i < group.size(); i++) {
+								auto *b = group[i];
+								idx_t rc = row_counts[i];
+								b->result->SetCardinality(rc);
+								auto &vec = b->result->data[0];
+
+								py::object slice = full_result.attr("slice")(offset, rc);
+								string err;
+								if (!WriteResult(slice, vec, rc, tid, err)) {
+									has_error.store(true, std::memory_order_release);
+									error_message = err;
+									for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
+									should_exit = true;
+									break;
+								}
+								vec.Flatten(rc);
+								SignalBatchDone(b);
+								offset += rc;
+							}
+						}
+					} else {
+						idx_t offset = 0;
+						for (idx_t i = 0; i < group.size(); i++) {
+							auto *b = group[i];
+							idx_t rc = row_counts[i];
+							b->result->SetCardinality(rc);
+							auto &vec = b->result->data[0];
+
+							py::object slice = full_result.attr("__getitem__")(py::slice(offset, offset + rc, 1));
+							string err;
+							if (!WriteResult(slice, vec, rc, tid, err)) {
+								has_error.store(true, std::memory_order_release);
+								error_message = err;
+								for (idx_t j = i; j < group.size(); j++) SignalBatchDone(group[j]);
+								should_exit = true;
+								break;
+							}
+							vec.Flatten(rc);
+							SignalBatchDone(b);
+							offset += rc;
+						}
+					}
+					prof.arrow_output_us += UsElapsed(t_out_start, Now());
 				}
-				fprintf(stderr, "[DEBUG] UDF returned, failed=%d\n", (int)failed);
 			} catch (const std::exception &e) {
-				fprintf(stderr, "[DEBUG] Exception in arrow path: %s\n", e.what());
 				has_error.store(true, std::memory_order_release);
 				error_message = std::string("C++ Exception: ") + e.what();
 				for (auto *b : group) SignalBatchDone(b);
@@ -460,7 +664,9 @@ void PythonUDFChannel::PythonThreadLoop() {
 					idx_t row_count = input->size();
 					result_chunk->SetCardinality(row_count);
 					auto &out_vec = result_chunk->data[0];
+					prof.total_rows += row_count;
 		
+					t_start = Now();
 					for (idx_t row = 0; row < row_count; row++) {
 						idx_t col_count = input->ColumnCount();
 						py::tuple args(col_count);
@@ -475,18 +681,26 @@ void PythonUDFChannel::PythonThreadLoop() {
 							args[c] = PythonObject::FromValue(value, input->data[c].GetType(),
 													   batch->client_props);
 						}
-						{
-							if (has_null) continue;
-							auto ret = py::reinterpret_steal<py::object>(
-							PyObject_CallObject(batch->udf_func, args.ptr()));
-							if (!ret || ret.is_none()) {
-								if (PyErr_Occurred()) { PyErr_Clear(); }
-								FlatVector::SetNull(out_vec, row, true);
-							} else {
-								TransformPythonObject(ret, out_vec, row);
+						if (has_null) continue;
+						py::tuple call_args = args;
+						if (batch->need_self && !udf_self.is_none()) {
+							py::tuple full_args(col_count + 1);
+							full_args[0] = udf_self;
+							for (idx_t c = 0; c < col_count; c++) {
+								full_args[c + 1] = args[c];
 							}
+							call_args = full_args;
+						}
+
+						auto ret = py::reinterpret_steal<py::object>(PyObject_CallObject(batch->udf_func, args.ptr()));
+						if (!ret || ret.is_none()) {
+							if (PyErr_Occurred()) { PyErr_Clear(); }
+							FlatVector::SetNull(out_vec, row, true);
+						} else {
+							TransformPythonObject(ret, out_vec, row);
 						}
 					}
+					prof.udf_exec_us += UsElapsed(t_start, Now());
 					SignalBatchDone(batch);
 				} catch (const std::exception &e) {
             		has_error.store(true, std::memory_order_release);
@@ -506,6 +720,14 @@ void PythonUDFChannel::PythonThreadLoop() {
 
 		if (should_exit) break;
 	}
+
+	if (!udf_self.is_none()) {
+		try {
+			udf_self.attr("con") = py::none();
+		} catch (...) {}
+	}
+	udf_self = py::none();
+
 	prof.Print();
 	Py_XDECREF(pa_module);
 	PyGILState_Release(gstate);

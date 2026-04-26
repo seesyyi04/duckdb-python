@@ -197,14 +197,15 @@ static void WaitForCoroutineWithWorkStealing(UDFBatch &batch, TaskScheduler &sch
 
 static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExceptionHandling exception_handling,
                                                   FunctionNullHandling null_handling,
-                                                  shared_ptr<PythonUDFChannel> channel) {
+                                                  shared_ptr<PythonUDFChannel> channel,
+												  bool need_self) {
  
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state, Vector &result) -> void {
 		auto &context = state.GetContext();
 		const bool default_null_handling = null_handling == FunctionNullHandling::DEFAULT_NULL_HANDLING;
 		auto &scheduler = TaskScheduler::GetScheduler(context);
  
-		// ---- NULL HANDLING ----
+		// null handling
 		auto result_validity = FlatVector::Validity(result);
 		SelectionVector selvec(input.size());
 		idx_t input_size = input.size();
@@ -239,7 +240,7 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 			count = input.size();
 		}
  
-		// ---- BUILD UDFBatch ON STACK ----
+		// build UDFBatch on stack
 		auto result_chunk = make_uniq<DataChunk>();
 		vector<LogicalType> result_types = {result.GetType()};
 		result_chunk->Initialize(Allocator::Get(context), result_types, STANDARD_VECTOR_SIZE);
@@ -253,14 +254,20 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 		batch.done.store(false, std::memory_order_relaxed);
 		batch.poison = false;
 		batch.client_props = context.GetClientProperties();
+		batch.need_self = need_self;
+		batch.vectorized = true;
+		batch.external_path = "";
 
-		// 1. ---- PREPARE ARROW (Before dispatch!) ----
+		// prepare arrow
         auto types = input.GetTypes();
         vector<string> names;
         for (idx_t i = 0; i < types.size(); i++) {
             names.push_back(StringUtil::Format("c%d", i));
         }
         batch.client_props = context.GetClientProperties();
+
+		memset(&batch.arrow_schema, 0, sizeof(batch.arrow_schema));
+		memset(&batch.arrow_array, 0, sizeof(batch.arrow_array));
         
         ArrowConverter::ToArrowSchema(&batch.arrow_schema, types, names, batch.client_props);
         ArrowAppender appender(types, STANDARD_VECTOR_SIZE, batch.client_props,
@@ -268,13 +275,13 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
         appender.Append(input, 0, input.size(), input.size());
         batch.arrow_array = appender.Finalize();
 
-        // 2. ---- DISPATCH TASK ----
+        // dispatch task
         PythonUDFTask task(*channel, batch);
         auto coroutine = task.ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
         coroutine.set_scheduler(&scheduler);
         coroutine.resume();
  
-        // 3. ---- WAIT FOR COMPLETION ----
+        // wait for completion
         WaitForCoroutineWithWorkStealing(batch, scheduler);
 		D_ASSERT(result_chunk->size() == count);
 
@@ -301,10 +308,6 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
         } else {
             VectorOperations::Copy(result_chunk->data[0], result, count, 0, 0);
         }
-
-        // 6. ---- CLEANUP ARROW ----
-        if (batch.arrow_schema.release) batch.arrow_schema.release(&batch.arrow_schema);
-        if (batch.arrow_array.release) batch.arrow_array.release(&batch.arrow_array);
 	};
 	return func;
 }
@@ -313,9 +316,8 @@ static scalar_function_t CreateNativeFunction(PyObject *function,
                                               PythonExceptionHandling exception_handling,
                                               const ClientProperties &client_properties,
                                               FunctionNullHandling null_handling,
-                                              shared_ptr<PythonUDFChannel> channel) {
-	// Through the capture of the lambda, we have access to the function pointer
-	// We just need to make sure that it doesn't get garbage collected
+                                              shared_ptr<PythonUDFChannel> channel,
+											  bool need_self) {
 	scalar_function_t func = [=](DataChunk &input, ExpressionState &state,
                                   Vector &result) -> void {
         auto &context = state.GetContext();
@@ -333,14 +335,16 @@ static scalar_function_t CreateNativeFunction(PyObject *function,
                                  STANDARD_VECTOR_SIZE);
 
         UDFBatch batch;
-        batch.input = &input;
+        batch.input = input_copy.get();
         batch.context = &context;
         batch.result = result_chunk.get();
         batch.udf_func = function;
         batch.return_type = result.GetType();
-        batch.vectorized = false;  // native row-by-row path
         batch.client_props = context.GetClientProperties();
         batch.done.store(false);
+		batch.need_self = need_self;
+		batch.vectorized = false;
+		batch.external_path = "";
 
         PythonUDFTask task(*channel, batch);
         auto coroutine = task.ExecuteAsync(TaskExecutionMode::PROCESS_ALL);
@@ -504,11 +508,21 @@ struct PythonUDFData {
 		}
 		(void)core.attr("multiarray");
 
+		bool need_self = false;
+		try {
+			py::object inspect = py::module::import("inspect");
+			py::object sig = inspect.attr("signature")(udf);
+			py::object params = sig.attr("parameters");
+			py::list param_names = py::list(params.attr("keys")());
+			need_self = py::len(param_names) > 0 && param_names[0].cast<std::string>() == "self";
+
+		} catch (...) { need_self = false; }
+
 		scalar_function_t func;
 		if (vectorized) {
-			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, channel);
+			func = CreateVectorizedFunction(udf.ptr(), exception_handling, null_handling, channel, need_self);
 		} else {
-			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling, channel);
+			func = CreateNativeFunction(udf.ptr(), exception_handling, client_properties, null_handling, channel, need_self);
 		}
 		FunctionStability function_side_effects =
 		    side_effects ? FunctionStability::VOLATILE : FunctionStability::CONSISTENT;
